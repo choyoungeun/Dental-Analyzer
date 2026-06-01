@@ -18,7 +18,12 @@ from difflib import SequenceMatcher
 # 0. API 키 세팅
 # ==========================================
 # 실제 서비스에서는 코드에 API 키를 직접 넣지 말고 st.secrets 사용 권장
-MY_API_KEY = st.secrets[ "MY_API_KEY"]
+# Streamlit Cloud의 Secrets에서 관리
+# Secrets 예시: My_KEY = "발급받은_API_KEY"
+try:
+    MY_API_KEY = st.secrets[ "MY_API_KEY"]
+except Exception:
+    MY_API_KEY = ""
 
 # 그래프 높이를 한 곳에서 통일 관리
 CHART_HEIGHT = 260
