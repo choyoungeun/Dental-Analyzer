@@ -26,13 +26,11 @@ GYEONGGI_OPEN_API_KEY = st.secrets["GYEONGGI_OPEN_API_KEY"]
 
 # 경기데이터드림 요청주소 https://openapi.gg.go.kr/TBGESTDEVALLSTM 
 
-=======
 SEOUL_OPEN_API_KEY = "4e7353486c64756436337758657467"
 GYEONGGI_OPEN_API_KEY = "b88f27037fbe4c6ab0e5e5075c6c1b12"
 
-# 경기데이터드림 요청주소가 https://openapi.gg.go.kr/TBGESTDEVALLSTM 이면
-# 서비스명은 아래처럼 TBGESTDEVALLSTM 만 넣어야 합니다.
->>>>>>> ba9c08d4211b13733e1b11df1cdeed79d6a0200a
+# 경기데이터드림 요청주소 https://openapi.gg.go.kr/TBGESTDEVALLSTM 
+
 GYEONGGI_SALES_SERVICE_NAME = "TBGESTDEVALLSTM"
 
 CHART_HEIGHT = 260
