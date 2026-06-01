@@ -25,6 +25,25 @@ try:
 except Exception:
     MY_API_KEY = ""
 
+# 서울/경기 상권분석 추정매출 API 키
+# Streamlit Secrets 예시:
+# SEOUL_OPEN_API_KEY = "서울열린데이터광장_API_KEY"
+# GYEONGGI_OPEN_API_KEY = "경기데이터드림_API_KEY"
+# GYEONGGI_SALES_SERVICE_NAME = "경기데이터드림_명세서의_서비스명"
+def _get_secret_any(names, default=""):
+    for name in names:
+        try:
+            value = st.secrets[name]
+            if value:
+                return value
+        except Exception:
+            pass
+    return default
+
+SEOUL_OPEN_API_KEY = _get_secret_any(["SEOUL_OPEN_API_KEY", "SEOUL_API_KEY", "Seoul_KEY"])
+GYEONGGI_OPEN_API_KEY = _get_secret_any(["GYEONGGI_OPEN_API_KEY", "GYEONGGI_API_KEY", "GG_KEY"])
+GYEONGGI_SALES_SERVICE_NAME = _get_secret_any(["GYEONGGI_SALES_SERVICE_NAME", "GG_SALES_SERVICE_NAME"])
+
 # 그래프 높이를 한 곳에서 통일 관리
 CHART_HEIGHT = 260
 
@@ -755,6 +774,366 @@ def _money_series_to_won(series, col_name=""):
         multiplier = 1
 
     return series.apply(lambda x: _korean_money_text_to_won(x, multiplier))
+
+
+
+# ==========================================
+# 서울/경기 지자체 상권분석 추정매출 API
+# ==========================================
+def _period_key_any(value):
+    text = str(value)
+    nums = re.findall(r"\d+", text)
+    if not nums:
+        return -1
+    joined = "".join(nums)
+    try:
+        return int(joined[:8])
+    except Exception:
+        return -1
+
+
+def _standardize_sales_api_df(df, source_name, column_map):
+    """서울/경기 API 응답을 공통 컬럼명으로 정리한다."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    out = pd.DataFrame()
+    for std_col, raw_col in column_map.items():
+        if raw_col and raw_col in df.columns:
+            out[std_col] = df[raw_col]
+        else:
+            out[std_col] = ""
+
+    out["자료출처"] = source_name
+    out["매출금액"] = _money_series_to_won(out["매출금액"], "매출금액")
+    out["매출건수"] = pd.to_numeric(out["매출건수"].astype(str).str.replace(",", "", regex=False), errors="coerce").fillna(0)
+    out["점포수"] = pd.to_numeric(out["점포수"].astype(str).str.replace(",", "", regex=False), errors="coerce")
+    out["기준기간"] = out["기준기간"].astype(str)
+    out["지역명"] = out["지역명"].astype(str)
+    out["행정동"] = out["행정동"].astype(str)
+    out["시군구"] = out["시군구"].astype(str)
+    out["업종명"] = out["업종명"].astype(str)
+    out = out[out["매출금액"].notna() & (out["매출금액"] > 0)].copy()
+    return out
+
+
+@st.cache(suppress_st_warning=True)
+def fetch_seoul_dental_sales_api(seoul_key):
+    """
+    서울시 상권분석서비스(추정매출-행정동) API.
+    서비스명: VwsmAdstrdSelngW
+    치과의원 업종만 필터링한다.
+    """
+    if not seoul_key:
+        return pd.DataFrame(), "서울 열린데이터광장 API 키가 없습니다. Secrets에 SEOUL_OPEN_API_KEY를 추가하세요."
+
+    service = "VwsmAdstrdSelngW"
+    base_url = f"http://openapi.seoul.go.kr:8088/{seoul_key}/json/{service}"
+    all_rows = []
+    start = 1
+    step = 1000
+
+    try:
+        while True:
+            end = start + step - 1
+            url = f"{base_url}/{start}/{end}/"
+            res = requests.get(url, timeout=25)
+            res.raise_for_status()
+            data = res.json()
+
+            if service not in data:
+                # 서울 API는 오류 시 {"RESULT": ...} 구조로 반환될 수 있음
+                return pd.DataFrame(), f"서울 추정매출 API 응답 오류: {data}"
+
+            body = data[service]
+            rows = body.get("row", [])
+            total_count = int(body.get("list_total_count", 0))
+            if not rows:
+                break
+            all_rows.extend(rows)
+            if end >= total_count:
+                break
+            start += step
+            if start > 120000:
+                break
+    except Exception as e:
+        return pd.DataFrame(), f"서울 추정매출 API 호출 실패: {e}"
+
+    if not all_rows:
+        return pd.DataFrame(), "서울 추정매출 API에서 데이터가 없습니다."
+
+    raw = pd.DataFrame(all_rows)
+    if "SVC_INDUTY_CD_NM" not in raw.columns:
+        return pd.DataFrame(), f"서울 API에서 업종 컬럼을 찾지 못했습니다. 현재 컬럼: {raw.columns.tolist()}"
+
+    raw = raw[raw["SVC_INDUTY_CD_NM"].astype(str).str.contains("치과", na=False)].copy()
+    if raw.empty:
+        return pd.DataFrame(), "서울 API에서 치과의원 추정매출 데이터를 찾지 못했습니다."
+
+    store_col = _find_first_column(raw, ["STOR_CO", "SIMILR_STOR_CO", "점포수", "상점수"])
+    mapped = _standardize_sales_api_df(
+        raw,
+        "서울시 상권분석서비스 추정매출 API",
+        {
+            "기준기간": _find_first_column(raw, ["STDR_YYQU_CD", "기준년분기", "기준분기"]),
+            "행정동": _find_first_column(raw, ["ADSTRD_CD_NM", "행정동", "행정동명"]),
+            "시군구": _find_first_column(raw, ["SIGNGU_CD_NM", "시군구", "자치구"]),
+            "지역명": _find_first_column(raw, ["ADSTRD_CD_NM", "행정동", "행정동명"]),
+            "업종명": "SVC_INDUTY_CD_NM",
+            "매출금액": _find_first_column(raw, ["THSMON_SELNG_AMT", "매출금액", "추정매출"]),
+            "매출건수": _find_first_column(raw, ["THSMON_SELNG_CO", "매출건수"]),
+            "점포수": store_col,
+        }
+    )
+    return mapped, None
+
+
+@st.cache(suppress_st_warning=True)
+def fetch_gyeonggi_dental_sales_api(gg_key, service_name):
+    """
+    경기도 발달/골목상권 추정매출 API.
+    경기데이터드림 명세서의 서비스명을 Secrets의 GYEONGGI_SALES_SERVICE_NAME에 넣어야 한다.
+    """
+    if not gg_key:
+        return pd.DataFrame(), "경기도 API 키가 없습니다. Secrets에 GYEONGGI_OPEN_API_KEY를 추가하세요."
+    if not service_name:
+        return pd.DataFrame(), "경기도 추정매출 API 서비스명이 없습니다. Secrets에 GYEONGGI_SALES_SERVICE_NAME을 추가하세요."
+
+    base_url = f"https://openapi.gg.go.kr/{service_name}"
+    all_rows = []
+    page = 1
+    size = 1000
+
+    try:
+        while True:
+            params = {"KEY": gg_key, "Type": "json", "pIndex": page, "pSize": size}
+            res = requests.get(base_url, params=params, timeout=25)
+            res.raise_for_status()
+            data = res.json()
+
+            if service_name not in data:
+                return pd.DataFrame(), f"경기도 API 응답 구조 확인 필요: {data}"
+
+            body = data[service_name]
+            rows = []
+            total_count = 0
+            for item in body:
+                if "head" in item:
+                    for h in item["head"]:
+                        if "list_total_count" in h:
+                            total_count = int(h["list_total_count"])
+                if "row" in item:
+                    rows = item["row"]
+
+            if not rows:
+                break
+            all_rows.extend(rows)
+            if total_count and page * size >= total_count:
+                break
+            page += 1
+            if page > 100:
+                break
+    except Exception as e:
+        return pd.DataFrame(), f"경기도 추정매출 API 호출 실패: {e}"
+
+    if not all_rows:
+        return pd.DataFrame(), "경기도 추정매출 API 데이터가 없습니다."
+
+    raw = pd.DataFrame(all_rows)
+    # 컬럼명은 데이터셋/서비스명에 따라 조금씩 달라질 수 있어 자동 탐색한다.
+    industry_col = _find_first_column(raw, [
+        "산업분류코드명", "업종명", "세분류명", "INDUTY_CLASS_NM", "INDUTY_NM", "SVC_INDUTY_CD_NM"
+    ])
+    sales_col = _find_first_column(raw, [
+        "매출금액", "매출액", "추정매출", "SELNG_AMT", "SALES_AMT", "AMT"
+    ])
+    if not industry_col or not sales_col:
+        return pd.DataFrame(), f"경기도 API에서 업종/매출 컬럼을 찾지 못했습니다. 현재 컬럼: {raw.columns.tolist()}"
+
+    raw = raw[raw[industry_col].astype(str).str.contains("치과", na=False)].copy()
+    if raw.empty:
+        return pd.DataFrame(), "경기도 API에서 치과 업종 추정매출 데이터를 찾지 못했습니다."
+
+    mapped = _standardize_sales_api_df(
+        raw,
+        "경기도 발달·골목상권 추정매출 API",
+        {
+            "기준기간": _find_first_column(raw, ["기준년분기", "기준연도", "STDR_YYQU_CD", "STDR_YEAR", "BASE_YY", "YEAR"]),
+            "행정동": _find_first_column(raw, ["행정동", "ADSTRD_NM", "ADMI_NM"]),
+            "시군구": _find_first_column(raw, ["시군구", "시군명", "SIGUN_NM", "SIGNGU_NM"]),
+            "지역명": _find_first_column(raw, ["상권명", "상권영역명", "TRDAR_NM", "AREA_NM", "시군명", "SIGUN_NM"]),
+            "업종명": industry_col,
+            "매출금액": sales_col,
+            "매출건수": _find_first_column(raw, ["매출건수", "SELNG_CO", "SALES_CNT", "건수"]),
+            "점포수": _find_first_column(raw, ["점포수", "STOR_CO", "STORE_CNT", "업소수"]),
+        }
+    )
+
+    # 연도와 분기가 따로 있으면 합쳐서 최신분기 정렬이 되도록 보정
+    year_col = _find_first_column(raw, ["기준연도", "STDR_YEAR", "BASE_YY", "YEAR"])
+    quarter_col = _find_first_column(raw, ["기준분기", "STDR_QU", "QUARTER", "분기"])
+    if year_col and quarter_col and len(mapped) == len(raw):
+        mapped["기준기간"] = raw[year_col].astype(str) + "Q" + raw[quarter_col].astype(str)
+
+    return mapped, None
+
+
+def _get_radius_dong_counts(df_dentist_merged):
+    if df_dentist_merged is None or df_dentist_merged.empty or "동이름" not in df_dentist_merged.columns:
+        return pd.DataFrame(columns=["행정동", "반경내치과수"])
+    out = (
+        df_dentist_merged["동이름"].fillna("기타").astype(str)
+        .replace("", "기타")
+        .value_counts()
+        .reset_index()
+    )
+    out.columns = ["행정동", "반경내치과수"]
+    out = out[out["행정동"] != "기타"].copy()
+    return out
+
+
+def _get_radius_sggu_counts(df_dentist_merged):
+    if df_dentist_merged is None or df_dentist_merged.empty:
+        return pd.DataFrame(columns=["시군구", "반경내치과수"])
+    tagged = _attach_region_to_dentists(df_dentist_merged)
+    if "매출시군구" not in tagged.columns:
+        return pd.DataFrame(columns=["시군구", "반경내치과수"])
+    out = tagged.groupby("매출시군구").size().reset_index(name="반경내치과수")
+    out = out.rename(columns={"매출시군구": "시군구"})
+    out = out[out["시군구"] != "지역미상"].copy()
+    return out
+
+
+def _summarize_commercial_sales(api_df, df_dentist_merged, region_level="dong"):
+    """서울/경기 상권분석 API 응답을 기존 화면 표시 스키마에 맞춰 요약한다."""
+    if api_df is None or api_df.empty:
+        return None, pd.DataFrame(), "상권분석 API 매출 데이터가 비어 있습니다."
+    if df_dentist_merged is None or df_dentist_merged.empty:
+        return None, pd.DataFrame(), "반경 내 치과가 없어 상권분석 매출을 계산할 수 없습니다."
+
+    df = api_df.copy()
+    df["__period_key"] = df["기준기간"].apply(_period_key_any)
+    latest_key = df["__period_key"].max()
+    latest_df = df[df["__period_key"] == latest_key].copy()
+    latest_period = str(latest_df["기준기간"].dropna().astype(str).iloc[0]) if not latest_df.empty else "최신"
+
+    detail_rows = []
+    if region_level == "dong":
+        radius_counts = _get_radius_dong_counts(df_dentist_merged)
+        if radius_counts.empty:
+            radius_counts = pd.DataFrame({"행정동": ["전체"], "반경내치과수": [len(df_dentist_merged)]})
+
+        for _, row in radius_counts.iterrows():
+            dong = str(row["행정동"])
+            radius_count = int(row["반경내치과수"])
+            target = latest_df[latest_df["행정동"].astype(str).str.contains(re.escape(dong), na=False)].copy()
+            if target.empty:
+                continue
+            total_sales = pd.to_numeric(target["매출금액"], errors="coerce").sum()
+            store_count = pd.to_numeric(target["점포수"], errors="coerce").sum()
+            if pd.isna(store_count) or store_count <= 0:
+                store_count = max(radius_count, 1)
+            per_clinic = total_sales / max(store_count, 1)
+            radius_sales = per_clinic * radius_count
+            detail_rows.append({
+                "기준기간": latest_period,
+                "시도": "서울",
+                "시군구": str(target["시군구"].dropna().astype(str).iloc[0]) if "시군구" in target.columns and not target.empty else "",
+                "행정동": dong,
+                "시군구전체치과수": int(store_count),
+                "반경내치과수": radius_count,
+                "시군구치과월추정시장규모": float(total_sales),
+                "치과1곳당월추정매출": float(per_clinic),
+                "반경내월추정시장규모": float(radius_sales),
+                "진료건수": float(pd.to_numeric(target["매출건수"], errors="coerce").sum()),
+                "자료출처": str(target["자료출처"].iloc[0]),
+            })
+    else:
+        radius_counts = _get_radius_sggu_counts(df_dentist_merged)
+        if radius_counts.empty:
+            radius_counts = pd.DataFrame({"시군구": ["전체"], "반경내치과수": [len(df_dentist_merged)]})
+
+        for _, row in radius_counts.iterrows():
+            sggu = str(row["시군구"])
+            radius_count = int(row["반경내치과수"])
+            target = latest_df[latest_df["시군구"].astype(str).str.contains(re.escape(sggu), na=False)].copy()
+            if target.empty:
+                # 경기 데이터가 상권명만 있고 시군구가 비어있으면 전체 최신 데이터를 사용
+                target = latest_df.copy()
+            total_sales = pd.to_numeric(target["매출금액"], errors="coerce").sum()
+            store_count = pd.to_numeric(target["점포수"], errors="coerce").sum()
+            if pd.isna(store_count) or store_count <= 0:
+                store_count = max(radius_count, 1)
+            per_clinic = total_sales / max(store_count, 1)
+            radius_sales = per_clinic * radius_count
+            detail_rows.append({
+                "기준기간": latest_period,
+                "시도": "경기",
+                "시군구": sggu,
+                "행정동": "",
+                "시군구전체치과수": int(store_count),
+                "반경내치과수": radius_count,
+                "시군구치과월추정시장규모": float(total_sales),
+                "치과1곳당월추정매출": float(per_clinic),
+                "반경내월추정시장규모": float(radius_sales),
+                "진료건수": float(pd.to_numeric(target["매출건수"], errors="coerce").sum()),
+                "자료출처": str(target["자료출처"].iloc[0]) if "자료출처" in target.columns and not target.empty else "경기도 상권분석 API",
+            })
+
+    if not detail_rows:
+        return None, pd.DataFrame(), "현재 반경의 행정동/시군구와 일치하는 상권분석 API 매출 데이터가 없습니다."
+
+    detail_df = pd.DataFrame(detail_rows)
+    total_radius_sales = pd.to_numeric(detail_df["반경내월추정시장규모"], errors="coerce").sum()
+    total_radius_clinics = int(pd.to_numeric(detail_df["반경내치과수"], errors="coerce").sum())
+    total_market_sales = pd.to_numeric(detail_df["시군구치과월추정시장규모"], errors="coerce").sum()
+    avg_per_clinic = total_radius_sales / max(total_radius_clinics, 1)
+    source = str(detail_df["자료출처"].dropna().astype(str).iloc[0])
+
+    summary = {
+        "기준기간": latest_period,
+        "파일최신기간": latest_period,
+        "매칭기준": "서울/경기 지자체 상권분석 추정매출 API",
+        "계산방식": source,
+        "자료종류": source,
+        "매출행수": len(detail_df),
+        "반경내치과수": total_radius_clinics,
+        "시군구치과월추정시장규모합계": float(total_market_sales),
+        "반경내치과1곳당평균월추정매출": float(avg_per_clinic),
+        "반경내월추정시장규모": float(total_radius_sales),
+        "최고지역1곳당월추정매출": float(detail_df["치과1곳당월추정매출"].max()),
+        "최저지역1곳당월추정매출": float(detail_df["치과1곳당월추정매출"].min()),
+        # 이전 화면/백업 호환 키
+        "상권치과업종총추정매출": float(total_market_sales),
+        "치과1곳당추정매출": float(avg_per_clinic),
+        "반경내치과추정총매출": float(total_radius_sales),
+        "최고1곳당추정매출": float(detail_df["치과1곳당월추정매출"].max()),
+        "최저1곳당추정매출": float(detail_df["치과1곳당월추정매출"].min()),
+    }
+    return summary, detail_df, None
+
+
+def estimate_dental_sales_from_commercial_api(df_dentist_merged):
+    """서울/경기라면 지자체 상권분석 추정매출 API를 최우선으로 사용한다."""
+    tagged = _attach_region_to_dentists(df_dentist_merged) if df_dentist_merged is not None else pd.DataFrame()
+    sido_values = []
+    if not tagged.empty and "매출시도" in tagged.columns:
+        sido_values = tagged["매출시도"].dropna().astype(str).tolist()
+    joined_sido = " ".join(sido_values)
+
+    if "서울" in joined_sido:
+        seoul_df, err = fetch_seoul_dental_sales_api(SEOUL_OPEN_API_KEY)
+        if err:
+            return None, pd.DataFrame(), err
+        return _summarize_commercial_sales(seoul_df, df_dentist_merged, region_level="dong")
+
+    if "경기" in joined_sido or "경기도" in joined_sido:
+        gg_df, err = fetch_gyeonggi_dental_sales_api(GYEONGGI_OPEN_API_KEY, GYEONGGI_SALES_SERVICE_NAME)
+        if err:
+            return None, pd.DataFrame(), err
+        return _summarize_commercial_sales(gg_df, df_dentist_merged, region_level="sggu")
+
+    return None, pd.DataFrame(), "서울/경기 지역이 아니어서 지자체 상권분석 API를 적용하지 않았습니다."
 
 
 def _read_table_flexible(file_path):
@@ -1563,22 +1942,31 @@ def load_sales_estimate_master():
 
 
 def estimate_dental_sales(lat, lon, radius_m, df_dentist_merged):
-    # 1순위: 공공데이터포털 국민건강보험공단 시군구별 진료과목별 진료비 파일
-    # 치과 실제 총매출은 아니지만, 무료로 받을 수 있는 전국 단위 '금액' 근거 데이터다.
+    # 1순위: 서울/경기 지자체 상권분석 추정매출 API
+    # - 서울: 서울시 상권분석서비스(추정매출-행정동)
+    # - 경기: 경기도 발달/골목상권 추정매출 API
+    commercial_summary, commercial_detail_df, commercial_err = estimate_dental_sales_from_commercial_api(df_dentist_merged)
+    if commercial_summary is not None:
+        return commercial_summary, commercial_detail_df, None
+
+    # 2순위: 공공데이터포털 국민건강보험공단 시군구별 진료과목별 진료비/진료건수 파일
+    # 치과 실제 총매출은 아니지만, 무료로 받을 수 있는 전국 단위 금액/진료량 근거 데이터다.
     claims_summary, claims_detail_df, claims_err = estimate_dental_sales_from_health_claims(df_dentist_merged)
     if claims_summary is not None:
+        claims_summary["매칭기준"] = f"상권분석 API 미사용 또는 실패 → 건강보험 기반 fallback ({commercial_err})"
         return claims_summary, claims_detail_df, None
 
-    # 2순위: 사용자가 직접 수집한 국세청/생활업종 매출 파일
+    # 3순위: 사용자가 직접 수집한 국세청/생활업종 매출 파일
     nts_summary, nts_detail_df, nts_err = estimate_dental_sales_from_nts(df_dentist_merged)
     if nts_summary is not None:
+        nts_summary["매칭기준"] = f"상권분석 API/건강보험 fallback → 국세청 파일 ({commercial_err})"
         return nts_summary, nts_detail_df, None
 
-    # 3순위: 사용자가 별도로 보유한 상권/카드/소상공인 추정매출 파일
+    # 4순위: 사용자가 별도로 보유한 상권/카드/소상공인 추정매출 파일
     sales_df, err = load_sales_estimate_master()
 
     if err:
-        return None, pd.DataFrame(), "\n".join([x for x in [claims_err, nts_err, err] if x])
+        return None, pd.DataFrame(), "\n".join([x for x in [commercial_err, claims_err, nts_err, err] if x])
 
     df = sales_df.copy()
 
