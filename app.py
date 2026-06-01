@@ -21,7 +21,6 @@ try:
 except Exception:
     MY_API_KEY = ""
 
-<<<<<<< HEAD
 SEOUL_OPEN_API_KEY = st.secrets["SEOUL_OPEN_API_KEY"]
 GYEONGGI_OPEN_API_KEY = st.secrets["GYEONGGI_OPEN_API_KEY"]
 
