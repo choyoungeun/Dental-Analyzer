@@ -21,28 +21,16 @@ from difflib import SequenceMatcher
 # Streamlit Cloud의 Secrets에서 관리
 # Secrets 예시: My_KEY = "발급받은_API_KEY"
 try:
-    MY_API_KEY = st.secrets[ "MY_API_KEY"]
+    MY_API_KEY = st.secrets["My_API_KEY"]
 except Exception:
     MY_API_KEY = ""
 
 # 서울/경기 상권분석 추정매출 API 키
-# Streamlit Secrets 예시:
+# 요청대로 서울/경기 키는 코드에 직접 입력하는 방식으로 변경
+# 아래 따옴표 안에 각각 발급받은 키와 경기데이터드림 서비스명을 넣으면 됩니다.
 SEOUL_OPEN_API_KEY = "4e7353486c64756436337758657467"
 GYEONGGI_OPEN_API_KEY = "b88f27037fbe4c6ab0e5e5075c6c1b12"
-GYEONGGI_SALES_SERVICE_NAME = "경기데이터드림_명세서"
-def _get_secret_any(names, default=""):
-    for name in names:
-        try:
-            value = st.secrets[name]
-            if value:
-                return value
-        except Exception:
-            pass
-    return default
-
-SEOUL_OPEN_API_KEY = _get_secret_any(["SEOUL_OPEN_API_KEY", "SEOUL_API_KEY", "Seoul_KEY"])
-GYEONGGI_OPEN_API_KEY = _get_secret_any(["GYEONGGI_OPEN_API_KEY", "GYEONGGI_API_KEY", "GG_KEY"])
-GYEONGGI_SALES_SERVICE_NAME = _get_secret_any(["GYEONGGI_SALES_SERVICE_NAME", "GG_SALES_SERVICE_NAME"])
+GYEONGGI_SALES_SERVICE_NAME = "경기도_추정매출_API_서비스"
 
 # 그래프 높이를 한 곳에서 통일 관리
 CHART_HEIGHT = 260
@@ -824,8 +812,8 @@ def fetch_seoul_dental_sales_api(seoul_key):
     서비스명: VwsmAdstrdSelngW
     치과의원 업종만 필터링한다.
     """
-    if not seoul_key:
-        return pd.DataFrame(), "서울 열린데이터광장 API 키가 없습니다. Secrets에 SEOUL_OPEN_API_KEY를 추가하세요."
+    if not seoul_key or str(seoul_key).startswith("여기에_"):
+        return pd.DataFrame(), "서울 열린데이터광장 API 키가 없습니다. 코드 상단 SEOUL_OPEN_API_KEY에 키를 직접 입력하세요."
 
     service = "VwsmAdstrdSelngW"
     base_url = f"http://openapi.seoul.go.kr:8088/{seoul_key}/json/{service}"
@@ -892,12 +880,12 @@ def fetch_seoul_dental_sales_api(seoul_key):
 def fetch_gyeonggi_dental_sales_api(gg_key, service_name):
     """
     경기도 발달/골목상권 추정매출 API.
-    경기데이터드림 명세서의 서비스명을 Secrets의 GYEONGGI_SALES_SERVICE_NAME에 넣어야 한다.
+    경기데이터드림 명세서의 서비스명을 코드 상단 GYEONGGI_SALES_SERVICE_NAME에 넣어야 한다.
     """
-    if not gg_key:
-        return pd.DataFrame(), "경기도 API 키가 없습니다. Secrets에 GYEONGGI_OPEN_API_KEY를 추가하세요."
-    if not service_name:
-        return pd.DataFrame(), "경기도 추정매출 API 서비스명이 없습니다. Secrets에 GYEONGGI_SALES_SERVICE_NAME을 추가하세요."
+    if not gg_key or str(gg_key).startswith("여기에_"):
+        return pd.DataFrame(), "경기도 API 키가 없습니다. 코드 상단 GYEONGGI_OPEN_API_KEY에 키를 직접 입력하세요."
+    if not service_name or str(service_name).startswith("여기에_"):
+        return pd.DataFrame(), "경기도 추정매출 API 서비스명이 없습니다. 코드 상단 GYEONGGI_SALES_SERVICE_NAME에 서비스명을 직접 입력하세요."
 
     base_url = f"https://openapi.gg.go.kr/{service_name}"
     all_rows = []
