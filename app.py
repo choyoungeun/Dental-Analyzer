@@ -21,7 +21,7 @@ from difflib import SequenceMatcher
 # Streamlit Cloud의 Secrets에서 관리
 # Secrets 예시: My_KEY = "발급받은_API_KEY"
 try:
-    MY_API_KEY = st.secrets["My_API_KEY"]
+    MY_API_KEY = st.secrets[ "MY_API_KEY"]
 except Exception:
     MY_API_KEY = ""
 
