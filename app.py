@@ -6,7 +6,7 @@ import folium
 from streamlit_folium import st_folium
 from datetime import datetime
 import re
-import altair as alt
+import altair as alt 
 import math
 import numpy as np
 import os
