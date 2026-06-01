@@ -736,6 +736,71 @@ def _get_radius_sggu_counts(df_dentist_merged):
 
     return out
 
+def _count_total_dental_clinics_by_region(sido="", sigungu="", dong="", fallback_count=1):
+    """
+    hosp_data.xlsx 전체 치과 데이터에서
+    매칭 지역의 전체 치과 수를 계산한다.
+
+    서울: 행정동 단위까지 가능하면 행정동 기준
+    경기: 보통 시군구 기준
+    """
+
+    try:
+        df_hosp, err = load_hosp_data()
+
+        if err or df_hosp.empty:
+            return max(int(fallback_count), 1)
+
+        df_hosp = df_hosp.copy()
+
+        addr_cols = [
+            "주소", "도로명주소", "지번주소", "소재지주소",
+            "요양기관주소", "소재지",
+            "시도코드명", "시군구코드명", "시도", "시군구"
+        ]
+
+        existing_cols = [c for c in addr_cols if c in df_hosp.columns]
+
+        if not existing_cols:
+            return max(int(fallback_count), 1)
+
+        df_hosp["주소통합"] = ""
+
+        for col in existing_cols:
+            df_hosp["주소통합"] += " " + df_hosp[col].astype(str)
+
+        target = df_hosp.copy()
+
+        if sido and sido != "지역미상":
+            sido_simple = _simple_sido_name(sido)
+            temp = target[
+                target["주소통합"].astype(str).str.contains(re.escape(str(sido)), na=False)
+                | target["주소통합"].astype(str).str.contains(re.escape(sido_simple), na=False)
+            ]
+            if not temp.empty:
+                target = temp
+
+        if sigungu and sigungu != "지역미상":
+            temp = target[
+                target["주소통합"].astype(str).str.contains(re.escape(str(sigungu)), na=False)
+            ]
+            if not temp.empty:
+                target = temp
+
+        if dong and dong not in ["기타", "전체", "지역미상"]:
+            temp = target[
+                target["주소통합"].astype(str).str.contains(re.escape(str(dong)), na=False)
+            ]
+            if not temp.empty:
+                target = temp
+
+        count = len(target)
+
+        # 전체 지역 치과 수는 반경 내 치과 수보다 작으면 안 됨
+        return max(int(count), int(fallback_count), 1)
+
+    except Exception:
+        return max(int(fallback_count), 1)
 
 # ==========================================
 # 6. 서울/경기 상권분석 추정매출 API
@@ -753,6 +818,102 @@ def _period_key_any(value):
         return int(joined[:8])
     except Exception:
         return -1
+
+
+def is_quarter_period(period):
+    text = str(period)
+    digits = re.sub(r"[^0-9]", "", text)
+
+    # 20212, 20231, 20234 같은 기준년분기 코드
+    if len(digits) == 5 and digits[-1] in ["1", "2", "3", "4"]:
+        return True
+
+    # 2021Q2 같은 코드
+    if re.search(r"\d{4}\s*Q[1-4]", text, re.IGNORECASE):
+        return True
+
+    return False
+
+
+def convert_period_sales_to_monthly(value, period):
+    try:
+        value = float(value)
+    except Exception:
+        return 0
+
+    if is_quarter_period(period):
+        return value / 3
+
+    return value
+
+
+def period_unit_label(period):
+    return "분기자료 월 환산" if is_quarter_period(period) else "월자료"
+
+
+def sales_period_year(period):
+    """서울/경기 상권 API 기준기간에서 연도만 추출한다. 예: 20252, 2025Q2, 2025-05 -> 2025"""
+    text = str(period)
+    m = re.search(r"(20\d{2})", text)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+
+def is_allowed_recent_sales_period(period):
+    """매출 데이터는 2025년/2026년 자료만 허용한다."""
+    year = sales_period_year(period)
+    return year in [2025, 2026]
+
+
+def extract_period_from_api_row(row):
+    """API 원본 row에서 기준기간 후보를 최대한 찾아낸다."""
+    period_keys = [
+        "STDR_YYQU_CD", "기준년분기", "기준분기",
+        "기준연월", "기준년월", "BASE_YM", "STD_YM",
+        "기준연도", "기준년도", "STDR_YEAR", "BASE_YY", "YEAR"
+    ]
+    quarter_keys = ["기준분기", "STDR_QU", "QUARTER", "분기"]
+
+    for key in period_keys:
+        if key in row and str(row.get(key, "")).strip() not in ["", "nan", "None"]:
+            value = str(row.get(key)).strip()
+            # 연도와 분기가 별도 컬럼으로 온 경우 2025Q2 형태로 합친다.
+            if key in ["기준연도", "기준년도", "STDR_YEAR", "BASE_YY", "YEAR"]:
+                for qkey in quarter_keys:
+                    if qkey in row and str(row.get(qkey, "")).strip() not in ["", "nan", "None"]:
+                        return f"{value}Q{str(row.get(qkey)).strip()}"
+            return value
+
+    # 최후 수단: 전체 값 중 2025/2026이 보이면 그 값을 사용
+    row_text = " ".join(str(v) for v in row.values())
+    m = re.search(r"(202[56])", row_text)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def keep_latest_2025_2026_rows(rows):
+    """row 목록에서 2025/2026 자료만 남기고, 그중 가장 최신 기준기간만 반환한다."""
+    best_key = -1
+    best_rows = []
+
+    for row in rows:
+        period = extract_period_from_api_row(row)
+        if not is_allowed_recent_sales_period(period):
+            continue
+
+        key = _period_key_any(period)
+        if key > best_key:
+            best_key = key
+            best_rows = [row]
+        elif key == best_key:
+            best_rows.append(row)
+
+    return best_rows, best_key
 
 
 def _standardize_sales_api_df(df, source_name, column_map):
@@ -784,6 +945,10 @@ def _standardize_sales_api_df(df, source_name, column_map):
 
 @st.cache(suppress_st_warning=True)
 def fetch_seoul_dental_sales_api(seoul_key, target_dongs=()):
+    """
+    서울시 상권분석 추정매출 API.
+    2025/2026년 자료만 허용하고, 대상 행정동의 최신 자료를 찾는 즉시 검색을 멈춘다.
+    """
     if not seoul_key or str(seoul_key).startswith("여기에_"):
         return pd.DataFrame(), "서울 열린데이터광장 API 키가 없습니다."
 
@@ -791,7 +956,7 @@ def fetch_seoul_dental_sales_api(seoul_key, target_dongs=()):
 
     cache_key = "_".join(target_dongs) if target_dongs else "all"
     cache_key = re.sub(r"[^가-힣A-Za-z0-9_]", "_", cache_key)
-    cache_file = f"seoul_sales_cache_{cache_key}.csv"
+    cache_file = f"seoul_sales_cache_2025_2026_latest_v1_{cache_key}.csv"
 
     if os.path.exists(cache_file):
         try:
@@ -804,9 +969,10 @@ def fetch_seoul_dental_sales_api(seoul_key, target_dongs=()):
     service = "VwsmAdstrdSelngW"
     base_url = f"http://openapi.seoul.go.kr:8088/{seoul_key}/json/{service}"
 
-    all_rows = []
     step = 1000
-    max_pages = 12
+    max_pages = 80
+    latest_rows = []
+    latest_key = -1
 
     try:
         for page in range(max_pages):
@@ -822,13 +988,19 @@ def fetch_seoul_dental_sales_api(seoul_key, target_dongs=()):
                 return pd.DataFrame(), f"서울 추정매출 API 응답 오류: {data}"
 
             rows = data[service].get("row", [])
-
             if not rows:
                 break
+
+            page_candidates = []
+            page_period_keys = []
 
             for row in rows:
                 industry = str(row.get("SVC_INDUTY_CD_NM", ""))
                 dong = str(row.get("ADSTRD_CD_NM", ""))
+                period = extract_period_from_api_row(row)
+
+                if period:
+                    page_period_keys.append(_period_key_any(period))
 
                 if "치과" not in industry:
                     continue
@@ -836,25 +1008,37 @@ def fetch_seoul_dental_sales_api(seoul_key, target_dongs=()):
                 if target_dongs and not any(target_dong in dong for target_dong in target_dongs):
                     continue
 
-                all_rows.append(row)
+                if not is_allowed_recent_sales_period(period):
+                    continue
 
-            if target_dongs and all_rows:
+                page_candidates.append(row)
+
+            if page_candidates:
+                best_rows, best_key = keep_latest_2025_2026_rows(page_candidates)
+                if best_key > latest_key:
+                    latest_rows = best_rows
+                    latest_key = best_key
+                elif best_key == latest_key:
+                    latest_rows.extend(best_rows)
+
+                # 서울 API는 보통 최신 기준기간부터 내려오므로,
+                # 대상 행정동의 2025/2026 최신 자료를 찾으면 즉시 중단한다.
                 break
 
-            if not target_dongs and len(all_rows) >= 20:
+            # 이미 최신 자료를 찾았고 다음 페이지가 더 오래된 기간이면 중단한다.
+            if latest_rows and page_period_keys and max(page_period_keys) < latest_key:
                 break
 
     except Exception as e:
-        return pd.DataFrame(), f"서울 추정매출 API 빠른 조회 실패: {e}"
+        return pd.DataFrame(), f"서울 추정매출 API 최신 조회 실패: {e}"
 
-    if not all_rows:
+    if not latest_rows:
         return (
             pd.DataFrame(),
-            f"서울 API에서 반경 내 행정동({', '.join(target_dongs) if target_dongs else '미상'})의 치과 추정매출을 찾지 못했습니다."
+            f"서울 API에서 반경 내 행정동({', '.join(target_dongs) if target_dongs else '미상'})의 2025/2026 치과 추정매출을 찾지 못했습니다."
         )
 
-    raw = pd.DataFrame(all_rows)
-
+    raw = pd.DataFrame(latest_rows)
     store_col = _find_first_column(raw, ["STOR_CO", "SIMILR_STOR_CO", "점포수", "상점수", "유사업종점포수"])
 
     mapped = _standardize_sales_api_df(
@@ -873,7 +1057,11 @@ def fetch_seoul_dental_sales_api(seoul_key, target_dongs=()):
     )
 
     if mapped.empty:
-        return pd.DataFrame(), "서울 치과 추정매출 데이터를 정리하지 못했습니다."
+        return pd.DataFrame(), "서울 2025/2026 치과 추정매출 데이터를 정리하지 못했습니다."
+
+    mapped = mapped[mapped["기준기간"].apply(is_allowed_recent_sales_period)].copy()
+    if mapped.empty:
+        return pd.DataFrame(), "서울 API 응답 중 2025/2026 기준기간 데이터가 없습니다."
 
     try:
         mapped.to_csv(cache_file, index=False, encoding="utf-8-sig")
@@ -882,9 +1070,12 @@ def fetch_seoul_dental_sales_api(seoul_key, target_dongs=()):
 
     return mapped, None
 
-
 @st.cache(suppress_st_warning=True)
 def fetch_gyeonggi_dental_sales_api(gg_key, service_name, target_sggus=()):
+    """
+    경기도 추정매출 API.
+    2025/2026년 자료만 허용하고, 대상 시군구의 최신 자료를 찾는 즉시 검색을 멈춘다.
+    """
     if not gg_key or str(gg_key).startswith("여기에_"):
         return pd.DataFrame(), "경기도 API 키가 없습니다."
 
@@ -895,7 +1086,7 @@ def fetch_gyeonggi_dental_sales_api(gg_key, service_name, target_sggus=()):
 
     cache_key = "_".join(target_sggus) if target_sggus else "all"
     cache_key = re.sub(r"[^가-힣A-Za-z0-9_]", "_", cache_key)
-    cache_file = f"gyeonggi_sales_cache_{cache_key}.csv"
+    cache_file = f"gyeonggi_sales_cache_2025_2026_latest_v1_{cache_key}.csv"
 
     if os.path.exists(cache_file):
         try:
@@ -906,9 +1097,10 @@ def fetch_gyeonggi_dental_sales_api(gg_key, service_name, target_sggus=()):
             pass
 
     base_url = f"https://openapi.gg.go.kr/{service_name}"
-    all_rows = []
     size = 1000
-    max_pages = 10
+    max_pages = 80
+    latest_rows = []
+    latest_key = -1
 
     try:
         for page in range(1, max_pages + 1):
@@ -923,7 +1115,6 @@ def fetch_gyeonggi_dental_sales_api(gg_key, service_name, target_sggus=()):
 
             body = data[service_name]
             rows = []
-
             for item in body:
                 if "row" in item:
                     rows = item["row"]
@@ -931,8 +1122,15 @@ def fetch_gyeonggi_dental_sales_api(gg_key, service_name, target_sggus=()):
             if not rows:
                 break
 
+            page_candidates = []
+            page_period_keys = []
+
             for row in rows:
                 row_text = " ".join(str(v) for v in row.values())
+                period = extract_period_from_api_row(row)
+
+                if period:
+                    page_period_keys.append(_period_key_any(period))
 
                 if "치과" not in row_text:
                     continue
@@ -940,24 +1138,36 @@ def fetch_gyeonggi_dental_sales_api(gg_key, service_name, target_sggus=()):
                 if target_sggus and not any(sggu in row_text for sggu in target_sggus):
                     continue
 
-                all_rows.append(row)
+                if not is_allowed_recent_sales_period(period):
+                    continue
 
-            if target_sggus and all_rows:
+                page_candidates.append(row)
+
+            if page_candidates:
+                best_rows, best_key = keep_latest_2025_2026_rows(page_candidates)
+                if best_key > latest_key:
+                    latest_rows = best_rows
+                    latest_key = best_key
+                elif best_key == latest_key:
+                    latest_rows.extend(best_rows)
+
+                # 경기 API도 보통 최신순으로 내려오므로,
+                # 대상 시군구의 2025/2026 최신 자료를 찾으면 즉시 중단한다.
                 break
 
-            if not target_sggus and len(all_rows) >= 20:
+            if latest_rows and page_period_keys and max(page_period_keys) < latest_key:
                 break
 
     except Exception as e:
-        return pd.DataFrame(), f"경기도 추정매출 API 빠른 조회 실패: {e}"
+        return pd.DataFrame(), f"경기도 추정매출 API 최신 조회 실패: {e}"
 
-    if not all_rows:
+    if not latest_rows:
         return (
             pd.DataFrame(),
-            f"경기도 API에서 반경 내 시군구({', '.join(target_sggus) if target_sggus else '미상'})의 치과 추정매출을 찾지 못했습니다."
+            f"경기도 API에서 반경 내 시군구({', '.join(target_sggus) if target_sggus else '미상'})의 2025/2026 치과 추정매출을 찾지 못했습니다."
         )
 
-    raw = pd.DataFrame(all_rows)
+    raw = pd.DataFrame(latest_rows)
 
     industry_col = _find_first_column(raw, ["산업분류코드명", "업종명", "세분류명", "INDUTY_CLASS_NM", "INDUTY_NM", "SVC_INDUTY_CD_NM"])
     sales_col = _find_first_column(raw, ["매출금액", "매출액", "추정매출", "SELNG_AMT", "SALES_AMT", "AMT"])
@@ -991,6 +1201,10 @@ def fetch_gyeonggi_dental_sales_api(gg_key, service_name, target_sggus=()):
     if year_col and quarter_col and len(mapped) == len(raw):
         mapped["기준기간"] = raw[year_col].astype(str) + "Q" + raw[quarter_col].astype(str)
 
+    mapped = mapped[mapped["기준기간"].apply(is_allowed_recent_sales_period)].copy()
+    if mapped.empty:
+        return pd.DataFrame(), "경기도 API 응답 중 2025/2026 기준기간 데이터가 없습니다."
+
     try:
         mapped.to_csv(cache_file, index=False, encoding="utf-8-sig")
     except Exception:
@@ -998,8 +1212,18 @@ def fetch_gyeonggi_dental_sales_api(gg_key, service_name, target_sggus=()):
 
     return mapped, None
 
-
 def _summarize_commercial_sales(api_df, df_dentist_merged, region_level="dong"):
+    """
+    서울/경기 상권분석 API 응답을 요약한다.
+
+    수정 핵심:
+    - 반경 내 치과 수로 지역 전체 매출을 나누지 않는다.
+    - 지역 전체 치과 수를 API 점포수 또는 hosp_data.xlsx 전체 치과 수로 계산한다.
+    - 공식:
+      지역 치과 1곳당 월 환산 추정매출 = 지역 치과 월 환산 시장규모 / 지역 전체 치과 수
+      반경 내 월 환산 추정시장규모 = 지역 1곳당 월 환산 추정매출 × 반경 내 치과 수
+    """
+
     if api_df is None or api_df.empty:
         return None, pd.DataFrame(), "상권분석 API 매출 데이터가 비어 있습니다."
 
@@ -1008,70 +1232,155 @@ def _summarize_commercial_sales(api_df, df_dentist_merged, region_level="dong"):
 
     df = api_df.copy()
     df["__period_key"] = df["기준기간"].apply(_period_key_any)
+
     latest_key = df["__period_key"].max()
     latest_df = df[df["__period_key"] == latest_key].copy()
-    latest_period = str(latest_df["기준기간"].dropna().astype(str).iloc[0]) if not latest_df.empty else "최신"
+
+    latest_period = (
+        str(latest_df["기준기간"].dropna().astype(str).iloc[0])
+        if not latest_df.empty
+        else "최신"
+    )
 
     detail_rows = []
 
+    # 서울: 행정동 기준
     if region_level == "dong":
         radius_counts = _get_radius_dong_counts(df_dentist_merged)
 
         if radius_counts.empty:
-            radius_counts = pd.DataFrame({"행정동": ["전체"], "반경내치과수": [len(df_dentist_merged)]})
+            radius_counts = pd.DataFrame({
+                "행정동": ["전체"],
+                "반경내치과수": [len(df_dentist_merged)]
+            })
 
         for _, row in radius_counts.iterrows():
             dong = str(row["행정동"])
             radius_count = int(row["반경내치과수"])
-            target = latest_df[latest_df["행정동"].astype(str).str.contains(re.escape(dong), na=False)].copy()
+
+            target = latest_df[
+                latest_df["행정동"].astype(str).str.contains(re.escape(dong), na=False)
+            ].copy()
 
             if target.empty:
                 continue
 
-            total_sales = pd.to_numeric(target["매출금액"], errors="coerce").sum()
-            store_count = pd.to_numeric(target["점포수"], errors="coerce").sum()
+            period_sales = pd.to_numeric(target["매출금액"], errors="coerce").sum()
 
-            if pd.isna(store_count) or store_count <= 0:
-                store_count = max(radius_count, 1)
+            # 분기 자료면 월 환산
+            monthly_sales = convert_period_sales_to_monthly(
+                period_sales,
+                latest_period
+            )
 
-            per_clinic = total_sales / max(store_count, 1)
+            api_store_count = pd.to_numeric(
+                target["점포수"],
+                errors="coerce"
+            ).sum()
+
+            sggu_name = (
+                str(target["시군구"].dropna().astype(str).iloc[0])
+                if "시군구" in target.columns and not target.empty
+                else ""
+            )
+
+            # API 점포수가 없거나 너무 작으면 hosp_data 전체 치과 수로 보정
+            hosp_store_count = _count_total_dental_clinics_by_region(
+                sido="서울",
+                sigungu=sggu_name,
+                dong=dong,
+                fallback_count=radius_count
+            )
+
+            store_count_candidates = [
+                x for x in [api_store_count, hosp_store_count]
+                if pd.notna(x) and float(x) > 0
+            ]
+
+            if store_count_candidates:
+                store_count = max(store_count_candidates)
+            else:
+                store_count = radius_count
+
+            # 안전장치: 지역 전체 치과 수가 반경 내 치과 수보다 작으면 안 됨
+            store_count = max(int(store_count), int(radius_count), 1)
+
+            per_clinic = monthly_sales / store_count
             radius_sales = per_clinic * radius_count
 
             detail_rows.append({
                 "기준기간": latest_period,
                 "시도": "서울",
-                "시군구": str(target["시군구"].dropna().astype(str).iloc[0]) if "시군구" in target.columns and not target.empty else "",
+                "시군구": sggu_name,
                 "행정동": dong,
+                "지역전체치과수": int(store_count),
                 "시군구전체치과수": int(store_count),
-                "반경내치과수": radius_count,
-                "시군구치과월추정시장규모": float(total_sales),
+                "반경내치과수": int(radius_count),
+                "지역치과월환산시장규모": float(monthly_sales),
+                "시군구치과월추정시장규모": float(monthly_sales),
                 "치과1곳당월추정매출": float(per_clinic),
                 "반경내월추정시장규모": float(radius_sales),
                 "진료건수": float(pd.to_numeric(target["매출건수"], errors="coerce").sum()),
                 "자료출처": str(target["자료출처"].iloc[0]),
+                "계산메모": f"지역 전체 치과 {int(store_count)}곳 기준으로 1곳당 매출 계산 후 반경 내 {radius_count}곳에 배분"
             })
 
+    # 경기: 시군구 기준
     else:
         radius_counts = _get_radius_sggu_counts(df_dentist_merged)
 
         if radius_counts.empty:
-            radius_counts = pd.DataFrame({"시군구": ["전체"], "반경내치과수": [len(df_dentist_merged)]})
+            radius_counts = pd.DataFrame({
+                "시군구": ["전체"],
+                "반경내치과수": [len(df_dentist_merged)]
+            })
 
         for _, row in radius_counts.iterrows():
             sggu = str(row["시군구"])
             radius_count = int(row["반경내치과수"])
-            target = latest_df[latest_df["시군구"].astype(str).str.contains(re.escape(sggu), na=False)].copy()
+
+            target = latest_df[
+                latest_df["시군구"].astype(str).str.contains(re.escape(sggu), na=False)
+            ].copy()
 
             if target.empty:
                 target = latest_df.copy()
 
-            total_sales = pd.to_numeric(target["매출금액"], errors="coerce").sum()
-            store_count = pd.to_numeric(target["점포수"], errors="coerce").sum()
+            if target.empty:
+                continue
 
-            if pd.isna(store_count) or store_count <= 0:
-                store_count = max(radius_count, 1)
+            period_sales = pd.to_numeric(target["매출금액"], errors="coerce").sum()
 
-            per_clinic = total_sales / max(store_count, 1)
+            monthly_sales = convert_period_sales_to_monthly(
+                period_sales,
+                latest_period
+            )
+
+            api_store_count = pd.to_numeric(
+                target["점포수"],
+                errors="coerce"
+            ).sum()
+
+            hosp_store_count = _count_total_dental_clinics_by_region(
+                sido="경기",
+                sigungu=sggu,
+                dong="",
+                fallback_count=radius_count
+            )
+
+            store_count_candidates = [
+                x for x in [api_store_count, hosp_store_count]
+                if pd.notna(x) and float(x) > 0
+            ]
+
+            if store_count_candidates:
+                store_count = max(store_count_candidates)
+            else:
+                store_count = radius_count
+
+            store_count = max(int(store_count), int(radius_count), 1)
+
+            per_clinic = monthly_sales / store_count
             radius_sales = per_clinic * radius_count
 
             detail_rows.append({
@@ -1079,38 +1388,63 @@ def _summarize_commercial_sales(api_df, df_dentist_merged, region_level="dong"):
                 "시도": "경기",
                 "시군구": sggu,
                 "행정동": "",
+                "지역전체치과수": int(store_count),
                 "시군구전체치과수": int(store_count),
-                "반경내치과수": radius_count,
-                "시군구치과월추정시장규모": float(total_sales),
+                "반경내치과수": int(radius_count),
+                "지역치과월환산시장규모": float(monthly_sales),
+                "시군구치과월추정시장규모": float(monthly_sales),
                 "치과1곳당월추정매출": float(per_clinic),
                 "반경내월추정시장규모": float(radius_sales),
                 "진료건수": float(pd.to_numeric(target["매출건수"], errors="coerce").sum()),
-                "자료출처": str(target["자료출처"].iloc[0]) if "자료출처" in target.columns and not target.empty else "경기도 상권분석 API",
+                "자료출처": (
+                    str(target["자료출처"].iloc[0])
+                    if "자료출처" in target.columns and not target.empty
+                    else "경기도 상권분석 API"
+                ),
+                "계산메모": f"지역 전체 치과 {int(store_count)}곳 기준으로 1곳당 매출 계산 후 반경 내 {radius_count}곳에 배분"
             })
 
     if not detail_rows:
         return None, pd.DataFrame(), "현재 반경의 행정동/시군구와 일치하는 상권분석 API 매출 데이터가 없습니다."
 
     detail_df = pd.DataFrame(detail_rows)
-    total_radius_sales = pd.to_numeric(detail_df["반경내월추정시장규모"], errors="coerce").sum()
-    total_radius_clinics = int(pd.to_numeric(detail_df["반경내치과수"], errors="coerce").sum())
-    total_market_sales = pd.to_numeric(detail_df["시군구치과월추정시장규모"], errors="coerce").sum()
+
+    total_radius_sales = pd.to_numeric(
+        detail_df["반경내월추정시장규모"],
+        errors="coerce"
+    ).sum()
+
+    total_radius_clinics = int(
+        pd.to_numeric(detail_df["반경내치과수"], errors="coerce").sum()
+    )
+
+    total_market_sales = pd.to_numeric(
+        detail_df["지역치과월환산시장규모"],
+        errors="coerce"
+    ).sum()
+
     avg_per_clinic = total_radius_sales / max(total_radius_clinics, 1)
+
     source = str(detail_df["자료출처"].dropna().astype(str).iloc[0])
 
     summary = {
         "기준기간": latest_period,
         "파일최신기간": latest_period,
         "매칭기준": "서울/경기 지자체 상권분석 추정매출 API",
-        "계산방식": source,
+        "계산방식": "지역 전체 치과 수 기준 배분 추정",
         "자료종류": source,
         "매출행수": len(detail_df),
+
         "반경내치과수": total_radius_clinics,
+
+        # 화면 표시용
         "시군구치과월추정시장규모합계": float(total_market_sales),
         "반경내치과1곳당평균월추정매출": float(avg_per_clinic),
         "반경내월추정시장규모": float(total_radius_sales),
         "최고지역1곳당월추정매출": float(detail_df["치과1곳당월추정매출"].max()),
         "최저지역1곳당월추정매출": float(detail_df["치과1곳당월추정매출"].min()),
+
+        # 이전 UI 호환
         "상권치과업종총추정매출": float(total_market_sales),
         "치과1곳당추정매출": float(avg_per_clinic),
         "반경내치과추정총매출": float(total_radius_sales),
@@ -2174,91 +2508,6 @@ def render_graph_summary_vertical(df_dentist_merged):
         st.info("동별 밀집도 그래프를 표시할 치과 데이터가 없습니다.")
 
 
-
-def render_commercial_area_summary(df_dentist_merged, lat, lon, radius_m):
-    """지도 오른쪽에 표시하는 기본 상권분석 요약 패널."""
-    st.markdown("##### 🧭 기본 상권분석")
-
-    if df_dentist_merged is None or df_dentist_merged.empty:
-        st.info("반경 내 치과가 없어 상권분석 요약을 표시할 수 없습니다.")
-        return
-
-    df = df_dentist_merged.copy()
-    clinic_count = len(df)
-
-    if "거리_m" not in df.columns:
-        try:
-            df["거리_m"] = df.apply(
-                lambda row: calculate_distance(lat, lon, row["위도"], row["경도"]),
-                axis=1
-            )
-        except Exception:
-            df["거리_m"] = pd.NA
-
-    nearest_distance = pd.to_numeric(df["거리_m"], errors="coerce").min()
-    avg_distance = pd.to_numeric(df["거리_m"], errors="coerce").mean()
-
-    area_km2 = math.pi * (float(radius_m) / 1000) ** 2
-    density_per_km2 = clinic_count / area_km2 if area_km2 > 0 else 0
-
-    young_count = len(df[pd.to_numeric(df.get("업력(년)", 0), errors="coerce").fillna(0).between(1, 2)])
-    old_count = len(df[pd.to_numeric(df.get("업력(년)", 0), errors="coerce").fillna(0) >= 15])
-
-    if "동이름" in df.columns and not df["동이름"].dropna().empty:
-        main_dong = str(df["동이름"].fillna("기타").value_counts().index[0])
-    else:
-        main_dong = "정보없음"
-
-    if density_per_km2 >= 25:
-        density_label = "매우 높음"
-    elif density_per_km2 >= 15:
-        density_label = "높음"
-    elif density_per_km2 >= 8:
-        density_label = "보통"
-    else:
-        density_label = "낮음"
-
-    st.markdown(
-        f"""
-        <div style='display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px; margin:6px 0 10px 0;'>
-            <div style='background:#f7fbff; border:1px solid #c8dff5; border-radius:12px; padding:10px; text-align:center;'>
-                <div style='font-size:12px; font-weight:700;'>반경 내 경쟁 치과</div>
-                <div style='font-size:22px; font-weight:800;'>{clinic_count}개</div>
-                <div style='font-size:11px; color:#555;'>반경 {radius_m}m</div>
-            </div>
-            <div style='background:#fff7f7; border:1px solid #f0c6c6; border-radius:12px; padding:10px; text-align:center;'>
-                <div style='font-size:12px; font-weight:700;'>치과 밀집도</div>
-                <div style='font-size:22px; font-weight:800;'>{density_label}</div>
-                <div style='font-size:11px; color:#555;'>{density_per_km2:.1f}개/km²</div>
-            </div>
-            <div style='background:#f8fff6; border:1px solid #cce8c4; border-radius:12px; padding:10px; text-align:center;'>
-                <div style='font-size:12px; font-weight:700;'>주요 분포 동</div>
-                <div style='font-size:22px; font-weight:800;'>{main_dong}</div>
-                <div style='font-size:11px; color:#555;'>가장 많이 잡힌 동</div>
-            </div>
-        </div>
-        <div style='display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px; margin:6px 0 10px 0;'>
-            <div style='background:#fafafa; border:1px solid #ddd; border-radius:12px; padding:10px; text-align:center;'>
-                <div style='font-size:12px; font-weight:700;'>가장 가까운 경쟁 치과</div>
-                <div style='font-size:20px; font-weight:800;'>{nearest_distance:.0f}m</div>
-                <div style='font-size:11px; color:#555;'>기준점 기준</div>
-            </div>
-            <div style='background:#fffaf0; border:1px solid #ead6a8; border-radius:12px; padding:10px; text-align:center;'>
-                <div style='font-size:12px; font-weight:700;'>평균 경쟁 거리</div>
-                <div style='font-size:20px; font-weight:800;'>{avg_distance:.0f}m</div>
-                <div style='font-size:11px; color:#555;'>반경 내 치과 평균</div>
-            </div>
-            <div style='background:#f6f0ff; border:1px solid #d7c2ef; border-radius:12px; padding:10px; text-align:center;'>
-                <div style='font-size:12px; font-weight:700;'>신규/장기 치과</div>
-                <div style='font-size:20px; font-weight:800;'>{young_count} / {old_count}</div>
-                <div style='font-size:11px; color:#555;'>3년미만 / 15년이상</div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-
 if not MY_API_KEY:
     st.error("⚠️ Streamlit secrets의 MY_API_KEY에 소상공인시장진흥공단 API 키를 입력해 주세요.")
 
@@ -2354,8 +2603,6 @@ else:
         with col2:
             st.subheader("📊 상권 및 교통 요약")
 
-            render_commercial_area_summary(df_dentist_merged, lat, lon, radius_input)
-
             st.markdown("##### 💰 치과 매출 추정")
 
             if sales_summary is None:
@@ -2377,7 +2624,7 @@ else:
                     f"""
                     <div style='display:grid; grid-template-columns:1fr 1fr; gap:8px; margin:6px 0 10px 0;'>
                         <div style='background:#fff8e8; border:1px solid #f0d39a; border-radius:12px; padding:10px; text-align:center;'>
-                            <div style='font-size:12px; font-weight:700;'>시군구 치과 월 추정시장규모 합계</div>
+                            <div style='font-size:12px; font-weight:700;'>반경 관련 지역 치과 월 환산 시장규모</div>
                             <div style='font-size:21px; font-weight:800; margin-top:3px;'>{format_won(sales_summary['시군구치과월추정시장규모합계'])}</div>
                         </div>
                         <div style='background:#eef9ff; border:1px solid #afd8ee; border-radius:12px; padding:10px; text-align:center;'>
@@ -2385,7 +2632,7 @@ else:
                             <div style='font-size:21px; font-weight:800; margin-top:3px;'>{format_won(sales_summary['반경내치과1곳당평균월추정매출'])}</div>
                         </div>
                         <div style='background:#f8f0ff; border:1px solid #d9b9ef; border-radius:12px; padding:10px; text-align:center;'>
-                            <div style='font-size:12px; font-weight:700;'>반경 내 월 추정시장규모</div>
+                            <div style='font-size:12px; font-weight:700;'>반경 내 월 환산 추정시장규모</div>
                             <div style='font-size:21px; font-weight:800; margin-top:3px;'>{format_won(sales_summary['반경내월추정시장규모'])}</div>
                             <div style='font-size:11px; color:#555;'>치과 {sales_summary['반경내치과수']}곳 기준</div>
                         </div>
