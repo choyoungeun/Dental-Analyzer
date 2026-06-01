@@ -2266,25 +2266,133 @@ def estimate_dental_sales(lat, lon, radius_m, df_dentist_merged):
 # 9. 주소 → 좌표
 # ==========================================
 def get_coords_from_address(address):
+    """
+    주소/역명/상권명을 좌표로 변환한다.
+    1순위: 자주 쓰는 지명 직접 매칭
+    2순위: 카카오 주소검색 API
+    3순위: Nominatim fallback
+    실패해도 앱이 죽지 않고 기존 기준점 유지
+    """
+
+    address = str(address).strip()
+
     if not address:
         return None, None
+
+    normalized = address.replace(" ", "")
+
+    # 자주 쓰는 역/상권명 직접 보정
+    place_alias = {
+        "인덕원": (37.4019, 126.9769),
+        "인덕원역": (37.4019, 126.9769),
+        "범계": (37.3897, 126.9508),
+        "범계역": (37.3897, 126.9508),
+        "평촌": (37.3943, 126.9639),
+        "평촌역": (37.3943, 126.9639),
+        "안양": (37.4010, 126.9227),
+        "안양역": (37.4010, 126.9227),
+        "강남": (37.4979, 127.0276),
+        "강남역": (37.4979, 127.0276),
+        "서울시청": (37.5665, 126.9780),
+        "시청": (37.5665, 126.9780),
+        "시청역": (37.5657, 126.9769),
+        "판교": (37.3948, 127.1112),
+        "판교역": (37.3948, 127.1112),
+        "정자": (37.3671, 127.1086),
+        "정자역": (37.3671, 127.1086),
+    }
+
+    if normalized in place_alias:
+        return place_alias[normalized]
+
+    # 1순위: 카카오 주소/키워드 검색 API
     try:
+        kakao_key = st.secrets.get("KAKAO_REST_API_KEY", "")
+
+        if kakao_key:
+            headers = {
+                "Authorization": f"KakaoAK {kakao_key}"
+            }
+
+            # 짧은 지명은 역명으로 보정해서 검색
+            query = address
+            if len(normalized) <= 6 and not any(x in normalized for x in ["시", "구", "동", "로", "길"]):
+                query = f"{address}역"
+
+            url = "https://dapi.kakao.com/v2/local/search/keyword.json"
+            params = {
+                "query": query,
+                "size": 1
+            }
+
+            res = requests.get(
+                url,
+                headers=headers,
+                params=params,
+                timeout=5
+            )
+
+            if res.status_code == 200:
+                data = res.json()
+                docs = data.get("documents", [])
+
+                if docs:
+                    lon = float(docs[0]["x"])
+                    lat = float(docs[0]["y"])
+                    return lat, lon
+
+            # 키워드 검색 실패 시 주소검색도 한 번 시도
+            url = "https://dapi.kakao.com/v2/local/search/address.json"
+            params = {
+                "query": address,
+                "size": 1
+            }
+
+            res = requests.get(
+                url,
+                headers=headers,
+                params=params,
+                timeout=5
+            )
+
+            if res.status_code == 200:
+                data = res.json()
+                docs = data.get("documents", [])
+
+                if docs:
+                    lon = float(docs[0]["x"])
+                    lat = float(docs[0]["y"])
+                    return lat, lon
+
+    except Exception as e:
+        st.session_state["geocode_error_message"] = f"카카오 좌표검색 실패: {e}"
+
+    # 2순위: Nominatim fallback
+    try:
+        search_address = address
+
+        if len(normalized) <= 6 and not any(x in normalized for x in ["시", "구", "동", "로", "길"]):
+            search_address = f"대한민국 {address}역"
+
         geolocator = Nominatim(
-            user_agent="youngeun-dental-analyzer",
+            user_agent="young-eun-dental-analyzer",
             timeout=7
         )
+
         location = geolocator.geocode(
-            address,
+            search_address,
             timeout=7,
-            country_code="kr"
+            country_codes="kr"
         )
 
         if location:
             return location.latitude, location.longitude
-    
+
     except Exception as e:
-        st.session_state["geocode_error_message"] = str(e)
+        st.session_state["geocode_error_message"] = f"Nominatim 좌표검색 실패: {e}"
         return None, None
+
+    st.session_state["geocode_error_message"] = f"'{address}' 좌표를 찾지 못했습니다."
     return None, None
 
 
@@ -2438,24 +2546,25 @@ st.markdown(
 with st.sidebar:
     st.header("⚙️ 기준 위치 설정")
 
-    address_input = st.text_input("개원 후보지 주소 입력:", "서울특별시 중구 세종대로 110")
+    address_input = st.text_input("개원 후보지 주소/역명 입력:", "서울특별시 중구 세종대로 110")
     run_btn = st.button("검색")
 
-    if run_btn:
-        lat, lon = get_coords_from_address(address_input)
+if run_btn:
+    lat, lon = get_coords_from_address(address_input)
 
-        if lat and lon:
-            st.session_state["target_lat"] = lat
-            st.session_state["target_lon"] = lon
-            st.session_state.pop("geocode_error_message","")
-        else:
-            st.error("주소를 찾을 수 없습니다.")
-            st.warning("주소좌표 변환 서버가 응답하지 않아 기존 기준점을 유지합니다."
-                       "잠시 후 다시 검색 혹은 지도를 클릭해서 기준점을 이동하세요."
-            )
-            if err_msg:
-                st.caption(f"좌표 변환 오류: {err_msg[:100]}")
-    st.markdown("---")
+    if lat and lon:
+        st.session_state["target_lat"] = lat
+        st.session_state["target_lon"] = lon
+        st.session_state.pop("geocode_error_message", None)
+    else:
+        err_msg = st.session_state.get("geocode_error_message", "")
+        st.warning(
+            "주소 좌표 변환에 실패해 기존 기준점을 유지합니다. "
+            "정확한 주소를 입력하거나 지도를 클릭해서 기준점을 이동하세요."
+        )
+        if err_msg:
+            st.caption(err_msg[:200])
+        st.markdown("---")
 
     radius_input = st.slider("탐색 반경 조절 (m)", 100, 2000, 500, 100)
 
