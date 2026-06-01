@@ -1733,7 +1733,7 @@ def estimate_dental_sales_from_health_claims(df_dentist_merged):
             "반경내월추정시장규모": float(radius_region_sales),
             "진료건수": float(total_cases),
             "진료인원": float(total_patients),
-        })
+            }})
 
     detail_df = pd.DataFrame(detail_rows)
 
