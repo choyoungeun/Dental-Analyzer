@@ -21,16 +21,24 @@ try:
 except Exception:
     MY_API_KEY = ""
 
+<<<<<<< HEAD
 SEOUL_OPEN_API_KEY = st.secrets["SEOUL_OPEN_API_KEY"]
 GYEONGGI_OPEN_API_KEY = st.secrets["GYEONGGI_OPEN_API_KEY"]
 
 # 경기데이터드림 요청주소 https://openapi.gg.go.kr/TBGESTDEVALLSTM 
 
+=======
+SEOUL_OPEN_API_KEY = "4e7353486c64756436337758657467"
+GYEONGGI_OPEN_API_KEY = "b88f27037fbe4c6ab0e5e5075c6c1b12"
+
+# 경기데이터드림 요청주소가 https://openapi.gg.go.kr/TBGESTDEVALLSTM 이면
+# 서비스명은 아래처럼 TBGESTDEVALLSTM 만 넣어야 합니다.
+>>>>>>> ba9c08d4211b13733e1b11df1cdeed79d6a0200a
 GYEONGGI_SALES_SERVICE_NAME = "TBGESTDEVALLSTM"
 
 CHART_HEIGHT = 260
 
-# Streamlit 구버전/신버전 rerun 호환
+
 def safe_rerun():
     if hasattr(st, "rerun"):
         st.rerun()
@@ -2261,12 +2269,25 @@ def estimate_dental_sales(lat, lon, radius_m, df_dentist_merged):
 # 9. 주소 → 좌표
 # ==========================================
 def get_coords_from_address(address):
-    geolocator = Nominatim(user_agent="clinic_analyzer")
-    location = geolocator.geocode(address)
+    if not address:
+        return None, None
+    try:
+        geolocator = Nominatim(
+            user_agent="youngeun-dental-analyzer",
+            timeout=7
+        )
+        location = geolocator.geocode(
+            address,
+            timeout=7,
+            country_code="kr"
+        )
 
-    if location:
-        return location.latitude, location.longitude
-
+        if location:
+            return location.latitude, location.longitude
+    
+    except Exception as e:
+        st.session_state["geocode_error_message"] = str(e)
+        return None, None
     return None, None
 
 
@@ -2429,9 +2450,14 @@ with st.sidebar:
         if lat and lon:
             st.session_state["target_lat"] = lat
             st.session_state["target_lon"] = lon
+            st.session_state.pop("geocode_error_message","")
         else:
             st.error("주소를 찾을 수 없습니다.")
-
+            st.warning("주소좌표 변환 서버가 응답하지 않아 기존 기준점을 유지합니다."
+                       "잠시 후 다시 검색 혹은 지도를 클릭해서 기준점을 이동하세요."
+            )
+            if err_msg:
+                st.caption(f"좌표 변환 오류: {err_msg[:100]}")
     st.markdown("---")
 
     radius_input = st.slider("탐색 반경 조절 (m)", 100, 2000, 500, 100)
