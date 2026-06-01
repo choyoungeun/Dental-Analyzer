@@ -2549,22 +2549,26 @@ with st.sidebar:
     address_input = st.text_input("개원 후보지 주소/역명 입력:", "서울특별시 중구 세종대로 110")
     run_btn = st.button("검색")
 
-if run_btn:
-    lat, lon = get_coords_from_address(address_input)
+    if run_btn:
+        lat, lon = get_coords_from_address(address_input)
 
-    if lat and lon:
-        st.session_state["target_lat"] = lat
-        st.session_state["target_lon"] = lon
-        st.session_state.pop("geocode_error_message", None)
-    else:
-        err_msg = st.session_state.get("geocode_error_message", "")
-        st.warning(
-            "주소 좌표 변환에 실패해 기존 기준점을 유지합니다. "
-            "정확한 주소를 입력하거나 지도를 클릭해서 기준점을 이동하세요."
-        )
-        if err_msg:
-            st.caption(err_msg[:200])
-        st.markdown("---")
+        if lat is not None and lon is not None:
+            st.session_state["target_lat"] = lat
+            st.session_state["target_lon"] = lon
+
+            if "geocode_error_message" in st.session_state:
+                del st.session_state["geocode_error_message"]
+
+        else:
+            err_msg = st.session_state.get("geocode_error_message", "")
+
+            st.warning(
+                "주소 좌표 변환에 실패해 기존 기준점을 유지합니다. "
+                "정확한 주소를 입력하거나 지도를 클릭해서 기준점을 이동하세요."
+            )
+
+            if err_msg:
+                st.caption(err_msg[:200])
 
     radius_input = st.slider("탐색 반경 조절 (m)", 100, 2000, 500, 100)
 
