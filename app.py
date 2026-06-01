@@ -809,56 +809,76 @@ def _standardize_sales_api_df(df, source_name, column_map):
 def fetch_seoul_dental_sales_api(seoul_key):
     """
     서울시 상권분석서비스(추정매출-행정동) API.
-    서비스명: VwsmAdstrdSelngW
-    치과의원 업종만 필터링한다.
+    최초 1회만 전체 API를 호출하고,
+    이후에는 seoul_dental_sales_cache.csv 파일을 우선 사용한다.
     """
+
+    cache_file = "seoul_dental_sales_cache.csv"
+
+    # 1. 로컬 캐시가 있으면 API 호출하지 않고 바로 사용
+    if os.path.exists(cache_file):
+        try:
+            cached = pd.read_csv(cache_file, encoding="utf-8-sig")
+            if not cached.empty:
+                return cached, None
+        except Exception:
+            pass
+
+    # 2. 캐시가 없을 때만 서울 API 호출
     if not seoul_key or str(seoul_key).startswith("여기에_"):
-        return pd.DataFrame(), "서울 열린데이터광장 API 키가 없습니다. 코드 상단 SEOUL_OPEN_API_KEY에 키를 직접 입력하세요."
+        return pd.DataFrame(), "서울 열린데이터광장 API 키가 없습니다."
 
     service = "VwsmAdstrdSelngW"
     base_url = f"http://openapi.seoul.go.kr:8088/{seoul_key}/json/{service}"
-    all_rows = []
+
+    all_dental_rows = []
     start = 1
     step = 1000
+    max_rows = 120000
 
     try:
-        while True:
+        while start <= max_rows:
             end = start + step - 1
             url = f"{base_url}/{start}/{end}/"
-            res = requests.get(url, timeout=25)
+
+            res = requests.get(url, timeout=8)
             res.raise_for_status()
             data = res.json()
 
             if service not in data:
-                # 서울 API는 오류 시 {"RESULT": ...} 구조로 반환될 수 있음
                 return pd.DataFrame(), f"서울 추정매출 API 응답 오류: {data}"
 
             body = data[service]
             rows = body.get("row", [])
             total_count = int(body.get("list_total_count", 0))
+
             if not rows:
                 break
-            all_rows.extend(rows)
+
+            # 여기서 바로 치과만 남김
+            for row in rows:
+                industry_name = str(row.get("SVC_INDUTY_CD_NM", ""))
+                if "치과" in industry_name:
+                    all_dental_rows.append(row)
+
             if end >= total_count:
                 break
+
             start += step
-            if start > 120000:
-                break
+
     except Exception as e:
         return pd.DataFrame(), f"서울 추정매출 API 호출 실패: {e}"
 
-    if not all_rows:
-        return pd.DataFrame(), "서울 추정매출 API에서 데이터가 없습니다."
-
-    raw = pd.DataFrame(all_rows)
-    if "SVC_INDUTY_CD_NM" not in raw.columns:
-        return pd.DataFrame(), f"서울 API에서 업종 컬럼을 찾지 못했습니다. 현재 컬럼: {raw.columns.tolist()}"
-
-    raw = raw[raw["SVC_INDUTY_CD_NM"].astype(str).str.contains("치과", na=False)].copy()
-    if raw.empty:
+    if not all_dental_rows:
         return pd.DataFrame(), "서울 API에서 치과의원 추정매출 데이터를 찾지 못했습니다."
 
-    store_col = _find_first_column(raw, ["STOR_CO", "SIMILR_STOR_CO", "점포수", "상점수"])
+    raw = pd.DataFrame(all_dental_rows)
+
+    store_col = _find_first_column(
+        raw,
+        ["STOR_CO", "SIMILR_STOR_CO", "점포수", "상점수"]
+    )
+
     mapped = _standardize_sales_api_df(
         raw,
         "서울시 상권분석서비스 추정매출 API",
@@ -873,6 +893,16 @@ def fetch_seoul_dental_sales_api(seoul_key):
             "점포수": store_col,
         }
     )
+
+    if mapped.empty:
+        return pd.DataFrame(), "서울 치과 추정매출 데이터를 정리하지 못했습니다."
+
+    # 3. 다음 실행부터 빠르게 쓰도록 저장
+    try:
+        mapped.to_csv(cache_file, index=False, encoding="utf-8-sig")
+    except Exception:
+        pass
+
     return mapped, None
 
 
