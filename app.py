@@ -18,7 +18,7 @@ from difflib import SequenceMatcher
 # 0. API 키 세팅
 # ==========================================
 # 실제 서비스에서는 코드에 API 키를 직접 넣지 말고 st.secrets 사용 권장
-MY_API_KEY = st.secrets["MY_API_KEY"]
+MY_API_KEY = st.secrets[ "MY_API_KEY"]
 
 # 그래프 높이를 한 곳에서 통일 관리
 CHART_HEIGHT = 260
@@ -995,99 +995,263 @@ def load_health_insurance_claims_sales_master():
     return df, None
 
 
+
+def _simple_sido_name(value):
+    text = str(value) if value is not None else ""
+    return (
+        text.replace("특별시", "")
+        .replace("광역시", "")
+        .replace("특별자치시", "")
+        .replace("특별자치도", "")
+        .replace("도", "")
+        .strip()
+    )
+
+
+def _extract_region_from_address_text(address):
+    """주소 문자열에서 시도/시군구를 최대한 추출한다."""
+    text = str(address)
+    parts = text.split()
+
+    sido = ""
+    sigungu = ""
+
+    if parts:
+        sido = parts[0]
+
+    # 서울특별시 중구, 경기도 안산시 단원구, 충청남도 천안시 서북구 모두 대응
+    for i, part in enumerate(parts):
+        if part.endswith(("시", "군", "구")):
+            if part.endswith("시") and i + 1 < len(parts) and parts[i + 1].endswith("구"):
+                sigungu = parts[i + 1]  # 건강보험 파일은 보통 '단원구'처럼 들어감
+                break
+            if part.endswith(("군", "구")):
+                sigungu = part
+                break
+            if part.endswith("시") and not sigungu:
+                sigungu = part
+
+    return sido, sigungu
+
+
+def _attach_region_to_dentists(df_dentist_merged):
+    """반경 내 치과별 시도/시군구 컬럼을 붙인다."""
+    df = df_dentist_merged.copy()
+
+    if df.empty:
+        df["매출시도"] = "지역미상"
+        df["매출시군구"] = "지역미상"
+        return df
+
+    addr_cols = [c for c in ["지번주소", "도로명주소", "주소"] if c in df.columns]
+    if not addr_cols:
+        df["매출시도"] = "지역미상"
+        df["매출시군구"] = "지역미상"
+        return df
+
+    def pick_addr(row):
+        for col in addr_cols:
+            val = str(row.get(col, "")).strip()
+            if val and val.lower() != "nan":
+                return val
+        return ""
+
+    regions = df.apply(lambda row: _extract_region_from_address_text(pick_addr(row)), axis=1)
+    df["매출시도"] = [r[0] if r[0] else "지역미상" for r in regions]
+    df["매출시군구"] = [r[1] if r[1] else "지역미상" for r in regions]
+    return df
+
+
+def _count_total_dental_clinics_by_sggu(sido, sigungu, fallback_count=1):
+    """hosp_data.xlsx 전체에서 해당 시군구 전체 치과 수를 계산한다."""
+    try:
+        df_hosp, err = load_hosp_data()
+        if err or df_hosp.empty:
+            return max(int(fallback_count), 1)
+
+        df_hosp = df_hosp.copy()
+        addr_cols = [
+            "주소", "도로명주소", "지번주소", "소재지주소", "요양기관주소", "소재지",
+            "시도코드명", "시군구코드명", "시도", "시군구"
+        ]
+        existing = [c for c in addr_cols if c in df_hosp.columns]
+        if not existing:
+            return max(int(fallback_count), 1)
+
+        df_hosp["주소통합"] = ""
+        for col in existing:
+            df_hosp["주소통합"] += " " + df_hosp[col].astype(str)
+
+        target = df_hosp.copy()
+
+        if sido and sido != "지역미상":
+            sido_simple = _simple_sido_name(sido)
+            temp = target[target["주소통합"].astype(str).str.contains(re.escape(sido_simple), na=False)]
+            if not temp.empty:
+                target = temp
+
+        if sigungu and sigungu != "지역미상":
+            temp = target[target["주소통합"].astype(str).str.contains(re.escape(sigungu), na=False)]
+            if not temp.empty:
+                target = temp
+
+        count = len(target)
+        return max(int(count), int(fallback_count), 1)
+
+    except Exception:
+        return max(int(fallback_count), 1)
+
+
+def _filter_claims_by_region(claims_df, sido, sigungu):
+    """건강보험 치과 진료정보에서 특정 시도/시군구를 매칭한다."""
+    target = claims_df.copy()
+
+    if sido and sido != "지역미상" and "시도" in target.columns:
+        sido_simple = _simple_sido_name(sido)
+        temp = target[
+            target["시도"].astype(str).str.contains(re.escape(str(sido)), na=False)
+            | target["시도"].astype(str).str.contains(re.escape(sido_simple), na=False)
+        ]
+        if not temp.empty:
+            target = temp
+
+    if sigungu and sigungu != "지역미상" and "시군구" in target.columns:
+        temp = target[target["시군구"].astype(str).str.contains(re.escape(str(sigungu)), na=False)]
+        if not temp.empty:
+            target = temp
+
+    return target
+
+
 def estimate_dental_sales_from_health_claims(df_dentist_merged):
+    """
+    반경이 여러 구/시군구에 걸치는 경우를 반영한 매출 추정.
+
+    공식:
+    각 시군구 치과 1곳당 월 추정매출 = 해당 시군구 치과 월 추정시장규모 / 해당 시군구 전체 치과 수
+    반경 내 월 추정시장규모 = Σ(각 시군구 1곳당 월 추정매출 × 반경 내 해당 시군구 치과 수)
+    """
     claims_df, err = load_health_insurance_claims_sales_master()
     if err:
         return None, pd.DataFrame(), err
 
-    df = claims_df.copy()
-    candidates = _region_candidates_from_dentists(df_dentist_merged)
+    if df_dentist_merged is None or df_dentist_merged.empty:
+        return None, pd.DataFrame(), "반경 내 치과가 없어 매출을 추정할 수 없습니다."
 
-    matched_df = pd.DataFrame()
-    match_basis = ""
+    df_radius = _attach_region_to_dentists(df_dentist_merged)
 
-    for sigungu in candidates.get("sigungu", []):
-        sigungu_simple = str(sigungu).split()[-1]
-        temp = df[
-            df["시군구"].astype(str).str.contains(re.escape(sigungu), na=False)
-            | df["시군구"].astype(str).str.contains(re.escape(sigungu_simple), na=False)
-        ]
-        if not temp.empty:
-            matched_df = temp.copy()
-            match_basis = f"시군구: {sigungu}"
-            break
+    # 반경 내 치과를 시도/시군구별로 묶는다.
+    region_counts = (
+        df_radius.groupby(["매출시도", "매출시군구"], dropna=False)
+        .size()
+        .reset_index(name="반경내치과수")
+    )
 
-    if matched_df.empty:
-        for sido in candidates.get("sido", []):
-            sido_simple = (
-                str(sido)
-                .replace("특별시", "")
-                .replace("광역시", "")
-                .replace("특별자치도", "")
-                .replace("특별자치시", "")
-                .replace("도", "")
-            )
-            temp = df[
-                df["시도"].astype(str).str.contains(re.escape(sido), na=False)
-                | df["시도"].astype(str).str.contains(re.escape(sido_simple), na=False)
-            ]
-            if not temp.empty:
-                matched_df = temp.copy()
-                match_basis = f"시도: {sido}"
-                break
+    # 파일 전체 최신기간도 같이 계산
+    claims_df = claims_df.copy()
+    claims_df["__period_key"] = claims_df["기준기간"].apply(_period_sort_key)
+    all_latest_key = claims_df["__period_key"].max()
+    all_latest_df = claims_df[claims_df["__period_key"] == all_latest_key].copy()
+    file_latest_period = str(all_latest_df["기준기간"].dropna().astype(str).iloc[0]) if not all_latest_df.empty else "최근"
 
-    if matched_df.empty:
-        matched_df = df.copy()
-        match_basis = "전국/파일 전체"
+    detail_rows = []
 
-    matched_df["__period_key"] = matched_df["기준기간"].apply(_period_sort_key)
-    latest_key = matched_df["__period_key"].max()
-    latest_df = matched_df[matched_df["__period_key"] == latest_key].copy()
-    if latest_df.empty:
-        latest_df = matched_df.copy()
-    latest_period = str(latest_df["기준기간"].dropna().astype(str).iloc[0]) if not latest_df.empty else "최근"
+    for _, region_row in region_counts.iterrows():
+        sido = str(region_row["매출시도"])
+        sigungu = str(region_row["매출시군구"])
+        radius_count = int(region_row["반경내치과수"])
 
-    total_claims = pd.to_numeric(latest_df["추정매출"], errors="coerce").sum()
-    total_cases = pd.to_numeric(latest_df.get("진료건수", pd.Series(dtype=float)), errors="coerce").sum()
-    total_patients = pd.to_numeric(latest_df.get("진료인원", pd.Series(dtype=float)), errors="coerce").sum()
-    dental_count = len(df_dentist_merged) if df_dentist_merged is not None else 0
+        region_claims = _filter_claims_by_region(claims_df, sido, sigungu)
 
-    avg_per_store = total_claims / dental_count if dental_count > 0 else total_claims
-    estimated_radius_total = avg_per_store * dental_count if dental_count > 0 else total_claims
+        # 해당 지역 매칭 실패 시 전체 파일 사용. 단, detail에 표시한다.
+        region_match_note = f"{sido} {sigungu}"
+        if region_claims.empty:
+            region_claims = claims_df.copy()
+            region_match_note = "지역매칭실패/전국평균"
 
-    df["__period_key"] = df["기준기간"].apply(_period_sort_key)
-    all_latest_key = df["__period_key"].max()
-    all_latest_df = df[df["__period_key"] == all_latest_key].copy()
-    region_group_cols = [c for c in ["시도", "시군구"] if c in all_latest_df.columns]
-    if region_group_cols:
-        region_amounts = all_latest_df.groupby(region_group_cols, dropna=False)["추정매출"].sum().reset_index()
-        max_sales = region_amounts["추정매출"].max()
-        min_sales = region_amounts["추정매출"].min()
+        region_claims["__period_key"] = region_claims["기준기간"].apply(_period_sort_key)
+        latest_key = region_claims["__period_key"].max()
+        latest_region_df = region_claims[region_claims["__period_key"] == latest_key].copy()
+
+        if latest_region_df.empty:
+            continue
+
+        latest_period = str(latest_region_df["기준기간"].dropna().astype(str).iloc[0]) if not latest_region_df.empty else "최근"
+        sggu_total_sales = pd.to_numeric(latest_region_df["추정매출"], errors="coerce").sum()
+        total_cases = pd.to_numeric(latest_region_df.get("진료건수", pd.Series(dtype=float)), errors="coerce").sum()
+        total_patients = pd.to_numeric(latest_region_df.get("진료인원", pd.Series(dtype=float)), errors="coerce").sum()
+
+        sggu_total_clinic_count = _count_total_dental_clinics_by_sggu(
+            sido=sido,
+            sigungu=sigungu,
+            fallback_count=radius_count
+        )
+
+        sales_per_clinic = sggu_total_sales / max(sggu_total_clinic_count, 1)
+        radius_region_sales = sales_per_clinic * radius_count
+
+        calc_methods = latest_region_df.get("계산방식", pd.Series(["건강보험 진료건수 기반 추정"])).dropna().astype(str).unique().tolist()
+        calc_method = calc_methods[0] if calc_methods else "건강보험 진료건수 기반 추정"
+
+        detail_rows.append({
+            "기준기간": latest_period,
+            "파일최신기간": file_latest_period,
+            "시도": sido,
+            "시군구": sigungu,
+            "매칭기준": region_match_note,
+            "계산방식": calc_method,
+            "업종명": ", ".join(latest_region_df["업종명"].dropna().astype(str).unique().tolist()[:4]),
+            "시군구치과월추정시장규모": float(sggu_total_sales),
+            "시군구전체치과수": int(sggu_total_clinic_count),
+            "반경내치과수": int(radius_count),
+            "치과1곳당월추정매출": float(sales_per_clinic),
+            "반경내월추정시장규모": float(radius_region_sales),
+            "진료건수": float(total_cases),
+            "진료인원": float(total_patients),
+        })
+
+    detail_df = pd.DataFrame(detail_rows)
+
+    if detail_df.empty:
+        return None, pd.DataFrame(), "건강보험 치과 진료정보와 반경 내 치과 지역을 매칭하지 못했습니다."
+
+    total_radius_sales = detail_df["반경내월추정시장규모"].sum()
+    total_radius_clinics = int(detail_df["반경내치과수"].sum())
+    weighted_avg_per_clinic = total_radius_sales / max(total_radius_clinics, 1)
+    total_sggu_market = detail_df["시군구치과월추정시장규모"].sum()
+    total_cases = detail_df["진료건수"].sum()
+    total_patients = detail_df["진료인원"].sum()
+
+    periods = detail_df["기준기간"].dropna().astype(str).unique().tolist()
+    if len(periods) == 1:
+        period_label = periods[0]
     else:
-        max_sales = total_claims
-        min_sales = total_claims
+        period_label = f"혼합({', '.join(periods[:3])}{'...' if len(periods) > 3 else ''})"
 
-    detail_df = latest_df.copy()
-    detail_df["1곳당추정매출"] = avg_per_store
-
-    calc_methods = detail_df.get("계산방식", pd.Series(["건강보험 진료건수 기반 추정"])).dropna().astype(str).unique().tolist()
-    calc_method = calc_methods[0] if calc_methods else "건강보험 진료건수 기반 추정"
+    calc_methods = detail_df["계산방식"].dropna().astype(str).unique().tolist()
+    calc_method = calc_methods[0] if len(calc_methods) == 1 else "지역별 건강보험 진료정보 기반 혼합 계산"
 
     summary = {
         "자료종류": "국민건강보험공단 시군구별 진료과목별 진료정보",
-        "기준기간": latest_period,
-        "파일최신기간": str(all_latest_df["기준기간"].dropna().astype(str).iloc[0]) if not all_latest_df.empty else latest_period,
-        "매칭기준": match_basis,
+        "기준기간": period_label,
+        "파일최신기간": file_latest_period,
+        "매칭기준": f"시군구별 가중계산 {len(detail_df)}개 지역",
         "계산방식": calc_method,
-        "매출행수": len(latest_df),
-        "반경내치과수": dental_count,
+        "매출행수": len(detail_df),
+        "반경내치과수": total_radius_clinics,
         "진료건수": total_cases,
         "진료인원": total_patients,
-        "상권치과업종총추정매출": total_claims,
-        "치과1곳당추정매출": avg_per_store,
-        "반경내치과추정총매출": estimated_radius_total,
-        "최고1곳당추정매출": max_sales,
-        "최저1곳당추정매출": min_sales,
+        "시군구치과월추정시장규모합계": float(total_sggu_market),
+        "반경내월추정시장규모": float(total_radius_sales),
+        "반경내치과1곳당평균월추정매출": float(weighted_avg_per_clinic),
+        "최고지역1곳당월추정매출": float(detail_df["치과1곳당월추정매출"].max()),
+        "최저지역1곳당월추정매출": float(detail_df["치과1곳당월추정매출"].min()),
+        # 이전 UI와의 호환용 키
+        "상권치과업종총추정매출": float(total_sggu_market),
+        "치과1곳당추정매출": float(weighted_avg_per_clinic),
+        "반경내치과추정총매출": float(total_radius_sales),
+        "최고1곳당추정매출": float(detail_df["치과1곳당월추정매출"].max()),
+        "최저1곳당추정매출": float(detail_df["치과1곳당월추정매출"].min()),
     }
 
     return summary, detail_df, None
@@ -1999,22 +2163,22 @@ else:
                     f"""
                     <div style='display:grid; grid-template-columns:1fr 1fr; gap:8px; margin:6px 0 10px 0;'>
                         <div style='background:#fff8e8; border:1px solid #f0d39a; border-radius:12px; padding:10px; text-align:center;'>
-                            <div style='font-size:12px; font-weight:700;'>상권 치과업종 총 추정매출</div>
-                            <div style='font-size:21px; font-weight:800; margin-top:3px;'>{format_won(sales_summary['상권치과업종총추정매출'])}</div>
+                            <div style='font-size:12px; font-weight:700;'>시군구 치과 월 추정시장규모 합계</div>
+                            <div style='font-size:21px; font-weight:800; margin-top:3px;'>{format_won(sales_summary['시군구치과월추정시장규모합계'])}</div>
                         </div>
                         <div style='background:#eef9ff; border:1px solid #afd8ee; border-radius:12px; padding:10px; text-align:center;'>
-                            <div style='font-size:12px; font-weight:700;'>치과 1곳당 추정매출</div>
-                            <div style='font-size:21px; font-weight:800; margin-top:3px;'>{format_won(sales_summary['치과1곳당추정매출'])}</div>
+                            <div style='font-size:12px; font-weight:700;'>반경 내 1곳당 평균 월 추정매출</div>
+                            <div style='font-size:21px; font-weight:800; margin-top:3px;'>{format_won(sales_summary['반경내치과1곳당평균월추정매출'])}</div>
                         </div>
                         <div style='background:#f8f0ff; border:1px solid #d9b9ef; border-radius:12px; padding:10px; text-align:center;'>
-                            <div style='font-size:12px; font-weight:700;'>반경 내 치과 추정 총매출</div>
-                            <div style='font-size:21px; font-weight:800; margin-top:3px;'>{format_won(sales_summary['반경내치과추정총매출'])}</div>
+                            <div style='font-size:12px; font-weight:700;'>반경 내 월 추정시장규모</div>
+                            <div style='font-size:21px; font-weight:800; margin-top:3px;'>{format_won(sales_summary['반경내월추정시장규모'])}</div>
                             <div style='font-size:11px; color:#555;'>치과 {sales_summary['반경내치과수']}곳 기준</div>
                         </div>
                         <div style='background:#f5f5f5; border:1px solid #d6d6d6; border-radius:12px; padding:10px; text-align:center;'>
-                            <div style='font-size:12px; font-weight:700;'>최고 / 최저 1곳당 추정</div>
-                            <div style='font-size:16px; font-weight:800; margin-top:4px;'>{format_won(sales_summary['최고1곳당추정매출'])}</div>
-                            <div style='font-size:16px; font-weight:800;'>{format_won(sales_summary['최저1곳당추정매출'])}</div>
+                            <div style='font-size:12px; font-weight:700;'>최고 / 최저 지역 1곳당</div>
+                            <div style='font-size:16px; font-weight:800; margin-top:4px;'>{format_won(sales_summary['최고지역1곳당월추정매출'])}</div>
+                            <div style='font-size:16px; font-weight:800;'>{format_won(sales_summary['최저지역1곳당월추정매출'])}</div>
                         </div>
                     </div>
                     """,
@@ -2023,9 +2187,9 @@ else:
 
                 if not sales_detail_df.empty:
                     detail_view = sales_detail_df.copy()
-                    show_cols = [c for c in ["기준기간", "원본파일", "동이름", "시도", "시군구", "업종명", "추정매출", "진료인원", "진료건수", "점포수", "사업자수", "평균사업존속연수", "1곳당추정매출"] if c in detail_view.columns]
+                    show_cols = [c for c in ["기준기간", "시도", "시군구", "시군구전체치과수", "반경내치과수", "시군구치과월추정시장규모", "치과1곳당월추정매출", "반경내월추정시장규모", "진료건수"] if c in detail_view.columns]
                     detail_view = detail_view[show_cols].head(20)
-                    for money_col in ["추정매출", "1곳당추정매출"]:
+                    for money_col in ["추정매출", "1곳당추정매출", "시군구치과월추정시장규모", "치과1곳당월추정매출", "반경내월추정시장규모"]:
                         if money_col in detail_view.columns:
                             detail_view[money_col] = detail_view[money_col].apply(format_won)
                     st.dataframe(detail_view, height=105)
