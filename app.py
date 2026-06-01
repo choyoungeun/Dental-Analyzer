@@ -27,9 +27,9 @@ except Exception:
 
 # 서울/경기 상권분석 추정매출 API 키
 # Streamlit Secrets 예시:
-# SEOUL_OPEN_API_KEY = "서울열린데이터광장_API_KEY"
-# GYEONGGI_OPEN_API_KEY = "경기데이터드림_API_KEY"
-# GYEONGGI_SALES_SERVICE_NAME = "경기데이터드림_명세서의_서비스명"
+SEOUL_OPEN_API_KEY = "4e7353486c64756436337758657467"
+GYEONGGI_OPEN_API_KEY = "b88f27037fbe4c6ab0e5e5075c6c1b12"
+GYEONGGI_SALES_SERVICE_NAME = "경기데이터드림_명세서"
 def _get_secret_any(names, default=""):
     for name in names:
         try:
