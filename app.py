@@ -30,7 +30,7 @@ except Exception:
 # 아래 따옴표 안에 각각 발급받은 키와 경기데이터드림 서비스명을 넣으면 됩니다.
 SEOUL_OPEN_API_KEY = "4e7353486c64756436337758657467"
 GYEONGGI_OPEN_API_KEY = "b88f27037fbe4c6ab0e5e5075c6c1b12"
-GYEONGGI_SALES_SERVICE_NAME = "경기도_추정매출_API_서비스"
+GYEONGGI_SALES_SERVICE_NAME = "TBGGESTDEVALLSTM"
 
 # 그래프 높이를 한 곳에서 통일 관리
 CHART_HEIGHT = 260
@@ -806,16 +806,28 @@ def _standardize_sales_api_df(df, source_name, column_map):
 
 
 @st.cache(suppress_st_warning=True)
-def fetch_seoul_dental_sales_api(seoul_key):
+def fetch_seoul_dental_sales_api(seoul_key, target_dongs=()):
     """
-    서울시 상권분석서비스(추정매출-행정동) API.
-    최초 1회만 전체 API를 호출하고,
-    이후에는 seoul_dental_sales_cache.csv 파일을 우선 사용한다.
+    서울시 상권분석서비스(추정매출-행정동) 빠른 조회 버전.
+
+    서울 API는 URL에서 행정동/업종 조건검색을 직접 지원하지 않아서
+    전체를 다 긁지 않고, 필요한 행정동의 치과 데이터가 발견되면 즉시 중단한다.
     """
 
-    cache_file = "seoul_dental_sales_cache.csv"
+    if not seoul_key or str(seoul_key).startswith("여기에_"):
+        return pd.DataFrame(), "서울 열린데이터광장 API 키가 없습니다."
 
-    # 1. 로컬 캐시가 있으면 API 호출하지 않고 바로 사용
+    target_dongs = tuple(
+        str(x).strip()
+        for x in target_dongs
+        if str(x).strip() and str(x).strip() != "기타"
+    )
+
+    cache_key = "_".join(target_dongs) if target_dongs else "all"
+    cache_key = re.sub(r"[^가-힣A-Za-z0-9_]", "_", cache_key)
+    cache_file = f"seoul_sales_cache_{cache_key}.csv"
+
+    # 1. 행정동별 캐시가 있으면 바로 사용
     if os.path.exists(cache_file):
         try:
             cached = pd.read_csv(cache_file, encoding="utf-8-sig")
@@ -824,59 +836,69 @@ def fetch_seoul_dental_sales_api(seoul_key):
         except Exception:
             pass
 
-    # 2. 캐시가 없을 때만 서울 API 호출
-    if not seoul_key or str(seoul_key).startswith("여기에_"):
-        return pd.DataFrame(), "서울 열린데이터광장 API 키가 없습니다."
-
     service = "VwsmAdstrdSelngW"
     base_url = f"http://openapi.seoul.go.kr:8088/{seoul_key}/json/{service}"
 
-    all_dental_rows = []
-    start = 1
+    all_rows = []
     step = 1000
-    max_rows = 120000
+
+    # 전체 10만 건 긁지 않도록 제한
+    max_pages = 12
 
     try:
-        while start <= max_rows:
+        for page in range(max_pages):
+            start = page * step + 1
             end = start + step - 1
             url = f"{base_url}/{start}/{end}/"
 
-            res = requests.get(url, timeout=8)
+            res = requests.get(url, timeout=5)
             res.raise_for_status()
             data = res.json()
 
             if service not in data:
                 return pd.DataFrame(), f"서울 추정매출 API 응답 오류: {data}"
 
-            body = data[service]
-            rows = body.get("row", [])
-            total_count = int(body.get("list_total_count", 0))
+            rows = data[service].get("row", [])
 
             if not rows:
                 break
 
-            # 여기서 바로 치과만 남김
             for row in rows:
-                industry_name = str(row.get("SVC_INDUTY_CD_NM", ""))
-                if "치과" in industry_name:
-                    all_dental_rows.append(row)
+                industry = str(row.get("SVC_INDUTY_CD_NM", ""))
+                dong = str(row.get("ADSTRD_CD_NM", ""))
 
-            if end >= total_count:
+                if "치과" not in industry:
+                    continue
+
+                if target_dongs:
+                    if not any(target_dong in dong for target_dong in target_dongs):
+                        continue
+
+                all_rows.append(row)
+
+            # 필요한 행정동의 치과 매출이 잡히면 바로 중단
+            if target_dongs and all_rows:
                 break
 
-            start += step
+            # 행정동을 못 잡았을 때도 치과 데이터가 조금이라도 잡히면 중단
+            if not target_dongs and len(all_rows) >= 20:
+                break
 
     except Exception as e:
-        return pd.DataFrame(), f"서울 추정매출 API 호출 실패: {e}"
+        return pd.DataFrame(), f"서울 추정매출 API 빠른 조회 실패: {e}"
 
-    if not all_dental_rows:
-        return pd.DataFrame(), "서울 API에서 치과의원 추정매출 데이터를 찾지 못했습니다."
+    if not all_rows:
+        return (
+            pd.DataFrame(),
+            f"서울 API에서 반경 내 행정동({', '.join(target_dongs) if target_dongs else '미상'})의 "
+            "치과 추정매출을 빠른 조회 범위 안에서 찾지 못했습니다."
+        )
 
-    raw = pd.DataFrame(all_dental_rows)
+    raw = pd.DataFrame(all_rows)
 
     store_col = _find_first_column(
         raw,
-        ["STOR_CO", "SIMILR_STOR_CO", "점포수", "상점수"]
+        ["STOR_CO", "SIMILR_STOR_CO", "점포수", "상점수", "유사업종점포수"]
     )
 
     mapped = _standardize_sales_api_df(
@@ -897,7 +919,6 @@ def fetch_seoul_dental_sales_api(seoul_key):
     if mapped.empty:
         return pd.DataFrame(), "서울 치과 추정매출 데이터를 정리하지 못했습니다."
 
-    # 3. 다음 실행부터 빠르게 쓰도록 저장
     try:
         mapped.to_csv(cache_file, index=False, encoding="utf-8-sig")
     except Exception:
@@ -907,25 +928,58 @@ def fetch_seoul_dental_sales_api(seoul_key):
 
 
 @st.cache(suppress_st_warning=True)
-def fetch_gyeonggi_dental_sales_api(gg_key, service_name):
+def fetch_gyeonggi_dental_sales_api(gg_key, service_name, target_sggus=()):
     """
-    경기도 발달/골목상권 추정매출 API.
-    경기데이터드림 명세서의 서비스명을 코드 상단 GYEONGGI_SALES_SERVICE_NAME에 넣어야 한다.
+    경기도 발달/골목상권 추정매출 API 빠른 조회 버전.
+    반경 내 시군구 + 치과 업종이 발견되면 즉시 중단한다.
     """
+
     if not gg_key or str(gg_key).startswith("여기에_"):
-        return pd.DataFrame(), "경기도 API 키가 없습니다. 코드 상단 GYEONGGI_OPEN_API_KEY에 키를 직접 입력하세요."
-    if not service_name or str(service_name).startswith("여기에_"):
-        return pd.DataFrame(), "경기도 추정매출 API 서비스명이 없습니다. 코드 상단 GYEONGGI_SALES_SERVICE_NAME에 서비스명을 직접 입력하세요."
+        return pd.DataFrame(), "경기도 API 키가 없습니다."
+
+    if (
+        not service_name
+        or str(service_name).startswith("여기에_")
+        or service_name == "경기도_추정매출_API_서비스"
+    ):
+        return pd.DataFrame(), "경기도 추정매출 API 서비스명이 아직 입력되지 않았습니다."
+
+    target_sggus = tuple(
+        str(x).strip()
+        for x in target_sggus
+        if str(x).strip() and str(x).strip() != "지역미상"
+    )
+
+    cache_key = "_".join(target_sggus) if target_sggus else "all"
+    cache_key = re.sub(r"[^가-힣A-Za-z0-9_]", "_", cache_key)
+    cache_file = f"gyeonggi_sales_cache_{cache_key}.csv"
+
+    if os.path.exists(cache_file):
+        try:
+            cached = pd.read_csv(cache_file, encoding="utf-8-sig")
+            if not cached.empty:
+                return cached, None
+        except Exception:
+            pass
 
     base_url = f"https://openapi.gg.go.kr/{service_name}"
+
     all_rows = []
-    page = 1
     size = 1000
 
+    # 전체 페이지 다 돌지 않도록 제한
+    max_pages = 10
+
     try:
-        while True:
-            params = {"KEY": gg_key, "Type": "json", "pIndex": page, "pSize": size}
-            res = requests.get(base_url, params=params, timeout=25)
+        for page in range(1, max_pages + 1):
+            params = {
+                "KEY": gg_key,
+                "Type": "json",
+                "pIndex": page,
+                "pSize": size,
+            }
+
+            res = requests.get(base_url, params=params, timeout=5)
             res.raise_for_status()
             data = res.json()
 
@@ -934,41 +988,63 @@ def fetch_gyeonggi_dental_sales_api(gg_key, service_name):
 
             body = data[service_name]
             rows = []
-            total_count = 0
+
             for item in body:
-                if "head" in item:
-                    for h in item["head"]:
-                        if "list_total_count" in h:
-                            total_count = int(h["list_total_count"])
                 if "row" in item:
                     rows = item["row"]
 
             if not rows:
                 break
-            all_rows.extend(rows)
-            if total_count and page * size >= total_count:
+
+            for row in rows:
+                row_text = " ".join(str(v) for v in row.values())
+
+                if "치과" not in row_text:
+                    continue
+
+                if target_sggus:
+                    if not any(sggu in row_text for sggu in target_sggus):
+                        continue
+
+                all_rows.append(row)
+
+            # 필요한 시군구의 치과 매출이 잡히면 바로 중단
+            if target_sggus and all_rows:
                 break
-            page += 1
-            if page > 100:
+
+            if not target_sggus and len(all_rows) >= 20:
                 break
+
     except Exception as e:
-        return pd.DataFrame(), f"경기도 추정매출 API 호출 실패: {e}"
+        return pd.DataFrame(), f"경기도 추정매출 API 빠른 조회 실패: {e}"
 
     if not all_rows:
-        return pd.DataFrame(), "경기도 추정매출 API 데이터가 없습니다."
+        return (
+            pd.DataFrame(),
+            f"경기도 API에서 반경 내 시군구({', '.join(target_sggus) if target_sggus else '미상'})의 "
+            "치과 추정매출을 빠른 조회 범위 안에서 찾지 못했습니다."
+        )
 
     raw = pd.DataFrame(all_rows)
-    # 컬럼명은 데이터셋/서비스명에 따라 조금씩 달라질 수 있어 자동 탐색한다.
+
     industry_col = _find_first_column(raw, [
-        "산업분류코드명", "업종명", "세분류명", "INDUTY_CLASS_NM", "INDUTY_NM", "SVC_INDUTY_CD_NM"
+        "산업분류코드명", "업종명", "세분류명",
+        "INDUTY_CLASS_NM", "INDUTY_NM", "SVC_INDUTY_CD_NM"
     ])
+
     sales_col = _find_first_column(raw, [
-        "매출금액", "매출액", "추정매출", "SELNG_AMT", "SALES_AMT", "AMT"
+        "매출금액", "매출액", "추정매출",
+        "SELNG_AMT", "SALES_AMT", "AMT"
     ])
+
     if not industry_col or not sales_col:
-        return pd.DataFrame(), f"경기도 API에서 업종/매출 컬럼을 찾지 못했습니다. 현재 컬럼: {raw.columns.tolist()}"
+        return (
+            pd.DataFrame(),
+            f"경기도 API에서 업종/매출 컬럼을 찾지 못했습니다. 현재 컬럼: {raw.columns.tolist()}"
+        )
 
     raw = raw[raw[industry_col].astype(str).str.contains("치과", na=False)].copy()
+
     if raw.empty:
         return pd.DataFrame(), "경기도 API에서 치과 업종 추정매출 데이터를 찾지 못했습니다."
 
@@ -987,11 +1063,16 @@ def fetch_gyeonggi_dental_sales_api(gg_key, service_name):
         }
     )
 
-    # 연도와 분기가 따로 있으면 합쳐서 최신분기 정렬이 되도록 보정
     year_col = _find_first_column(raw, ["기준연도", "STDR_YEAR", "BASE_YY", "YEAR"])
     quarter_col = _find_first_column(raw, ["기준분기", "STDR_QU", "QUARTER", "분기"])
+
     if year_col and quarter_col and len(mapped) == len(raw):
         mapped["기준기간"] = raw[year_col].astype(str) + "Q" + raw[quarter_col].astype(str)
+
+    try:
+        mapped.to_csv(cache_file, index=False, encoding="utf-8-sig")
+    except Exception:
+        pass
 
     return mapped, None
 
@@ -1132,28 +1213,69 @@ def _summarize_commercial_sales(api_df, df_dentist_merged, region_level="dong"):
 
 
 def estimate_dental_sales_from_commercial_api(df_dentist_merged):
-    """서울/경기라면 지자체 상권분석 추정매출 API를 최우선으로 사용한다."""
-    tagged = _attach_region_to_dentists(df_dentist_merged) if df_dentist_merged is not None else pd.DataFrame()
+    """
+    서울/경기 지자체 상권분석 추정매출 API 우선 사용.
+    반경 내 행정동/시군구만 대상으로 빠르게 조회한다.
+    """
+
+    if df_dentist_merged is None or df_dentist_merged.empty:
+        return None, pd.DataFrame(), "반경 내 치과가 없어 상권분석 API를 적용하지 않았습니다."
+
+    tagged = _attach_region_to_dentists(df_dentist_merged)
+
     sido_values = []
-    if not tagged.empty and "매출시도" in tagged.columns:
+    if "매출시도" in tagged.columns:
         sido_values = tagged["매출시도"].dropna().astype(str).tolist()
+
     joined_sido = " ".join(sido_values)
 
+    # 서울
     if "서울" in joined_sido:
-        seoul_df, err = fetch_seoul_dental_sales_api(SEOUL_OPEN_API_KEY)
-        if err:
-            return None, pd.DataFrame(), err
-        return _summarize_commercial_sales(seoul_df, df_dentist_merged, region_level="dong")
+        dong_counts = _get_radius_dong_counts(df_dentist_merged)
 
-    if "경기" in joined_sido or "경기도" in joined_sido:
-        gg_df, err = fetch_gyeonggi_dental_sales_api(GYEONGGI_OPEN_API_KEY, GYEONGGI_SALES_SERVICE_NAME)
+        target_dongs = []
+        if not dong_counts.empty:
+            target_dongs = dong_counts["행정동"].dropna().astype(str).tolist()
+
+        seoul_df, err = fetch_seoul_dental_sales_api(
+            SEOUL_OPEN_API_KEY,
+            tuple(target_dongs)
+        )
+
         if err:
             return None, pd.DataFrame(), err
-        return _summarize_commercial_sales(gg_df, df_dentist_merged, region_level="sggu")
+
+        return _summarize_commercial_sales(
+            seoul_df,
+            df_dentist_merged,
+            region_level="dong"
+        )
+
+    # 경기도
+    if "경기" in joined_sido or "경기도" in joined_sido:
+        sggu_counts = _get_radius_sggu_counts(df_dentist_merged)
+
+        target_sggus = []
+        if not sggu_counts.empty:
+            target_sggus = sggu_counts["시군구"].dropna().astype(str).tolist()
+
+        gg_df, err = fetch_gyeonggi_dental_sales_api(
+            GYEONGGI_OPEN_API_KEY,
+            GYEONGGI_SALES_SERVICE_NAME,
+            tuple(target_sggus)
+        )
+
+        if err:
+            return None, pd.DataFrame(), err
+
+        return _summarize_commercial_sales(
+            gg_df,
+            df_dentist_merged,
+            region_level="sggu"
+        )
 
     return None, pd.DataFrame(), "서울/경기 지역이 아니어서 지자체 상권분석 API를 적용하지 않았습니다."
-
-
+    
 def _read_table_flexible(file_path):
     """CSV/XLSX를 최대한 유연하게 읽는다. XLSX는 모든 시트를 합친다."""
     if file_path.lower().endswith((".xlsx", ".xls")):
@@ -1596,8 +1718,9 @@ def estimate_dental_sales_from_health_claims(df_dentist_merged):
         calc_method = calc_methods[0] if calc_methods else "건강보험 진료건수 기반 추정"
 
         detail_rows.append({
+            summary = {
             "기준기간": latest_period,
-            "파일최신기간": file_latest_period,
+            "파일최신기간": latest_period,
             "시도": sido,
             "시군구": sigungu,
             "매칭기준": region_match_note,
