@@ -756,24 +756,27 @@ else:
 
             if not df_dentist_hira.empty:
                 # [성능 최적화 완료지점] 1대1 매칭 시 하버사인 거리 계산 최소화
+# [성능 및 안정성 최적화 버전] 757번줄 부근 에러 해결
 def find_opening_date(row):
     temp = df_dentist_hira.copy()
     
-    # 괄호 ()를 추가하여 연산자 우선순위 오류를 해결했습니다.
-    temp = temp[
-        ((temp["위도"] - row["위도"]).abs() < 0.001) & 
-        ((temp["경도"] - row["경도"]).abs() < 0.001)
-    ]
+    # 에러 원인인 '&' 연산자를 제거하고 두 단계로 나누어 안전하게 필터링합니다.
+    temp = temp[(temp["위도"] - row["위도"]).abs() < 0.001]
+    temp = temp[(temp["경도"] - row["경도"]).abs() < 0.001]
     
+    # 이제 temp.empty가 정상적으로 판단됩니다.
     if temp.empty: 
         return "정보없음", 0
     
+    # 정밀 거리 계산 및 매칭
     temp["match_dist"] = temp.apply(
         lambda hira_r: calculate_distance(row["위도"], row["경도"], hira_r["위도"], hira_r["경도"]), 
         axis=1
     )
     match_row = temp[temp["match_dist"] <= 50].sort_values(by="match_dist")
+    
     return format_opening_date(match_row.iloc[0]["개업일"]) if not match_row.empty else ("정보없음", 0)
+
 
                 df_dentist_merged[["개업일", "업력(년)"]] = df_dentist_merged.apply(find_opening_date, axis=1, result_type="expand")
             df_dentist_merged = remove_duplicate_clinics(df_dentist_merged)
